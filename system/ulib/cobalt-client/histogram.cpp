@@ -9,7 +9,7 @@
 #include <cobalt-client/cpp/histogram.h>
 
 #include <cobalt-client/cpp/histogram-internal.h>
-#include <cobalt-client/cpp/histogram-options.h>
+#include <cobalt-client/cpp/metric-options.h>
 #include <fbl/limits.h>
 #include <fuchsia/cobalt/c/fidl.h>
 
@@ -68,19 +68,19 @@ uint32_t GetExponentialBucket(double value, const HistogramOptions& options, dou
 }
 
 void LoadExponential(HistogramOptions* options) {
-    double max_value =
+    options->max_value =
         options->scalar * pow(options->base, options->bucket_count) + options->offset;
-    options->map_fn = [max_value](double val, const HistogramOptions& options) {
-        return internal::GetExponentialBucket(val, options, max_value);
+    options->map_fn = [](double val, const HistogramOptions& options) {
+        return internal::GetExponentialBucket(val, options, options.max_value);
     };
     options->reverse_map_fn = internal::GetExponentialBucketValue;
 }
 
 void LoadLinear(HistogramOptions* options) {
-    double max_value =
+    options->max_value =
         static_cast<double>(options->scalar * options->bucket_count + options->offset);
-    options->map_fn = [max_value](double val, const HistogramOptions& options) {
-        return internal::GetLinearBucket(val, options, max_value);
+    options->map_fn = [](double val, const HistogramOptions& options) {
+        return internal::GetLinearBucket(val, options, options.max_value);
     };
     options->reverse_map_fn = internal::GetLinearBucketValue;
 }
@@ -96,9 +96,9 @@ BaseHistogram::BaseHistogram(uint32_t num_buckets) {
 
 BaseHistogram::BaseHistogram(BaseHistogram&& other) = default;
 
-RemoteHistogram::RemoteHistogram(uint32_t num_buckets, uint32_t metric_id,
+RemoteHistogram::RemoteHistogram(uint32_t num_buckets, const RemoteMetricInfo& metric_info,
                                  RemoteHistogram::EventBuffer buffer)
-    : BaseHistogram(num_buckets), buffer_(fbl::move(buffer)), metric_id_(metric_id) {
+    : BaseHistogram(num_buckets), buffer_(fbl::move(buffer)), metric_info_(metric_info) {
     bucket_buffer_.reserve(num_buckets);
     for (uint32_t i = 0; i < num_buckets; ++i) {
         HistogramBucket bucket;
@@ -113,8 +113,7 @@ RemoteHistogram::RemoteHistogram(uint32_t num_buckets, uint32_t metric_id,
 
 RemoteHistogram::RemoteHistogram(RemoteHistogram&& other)
     : BaseHistogram(fbl::move(other)), bucket_buffer_(fbl::move(other.bucket_buffer_)),
-      buffer_(fbl::move(other.buffer_)),
-      metric_id_(other.metric_id_) {}
+      buffer_(fbl::move(other.buffer_)), metric_info_(other.metric_info_) {}
 
 bool RemoteHistogram::Flush(const RemoteHistogram::FlushFn& flush_handler) {
     if (!buffer_.TryBeginFlush()) {
@@ -127,20 +126,12 @@ bool RemoteHistogram::Flush(const RemoteHistogram::FlushFn& flush_handler) {
         bucket_buffer_[bucket_index].count = buckets_[bucket_index].Exchange();
     }
 
-    flush_handler(metric_id_, buffer_, fbl::BindMember(&buffer_, &EventBuffer::CompleteFlush));
+    flush_handler(metric_info_, buffer_, fbl::BindMember(&buffer_, &EventBuffer::CompleteFlush));
     return true;
 }
 } // namespace internal
 
-HistogramOptions::HistogramOptions(const HistogramOptions& other)
-    : base(other.base), scalar(other.scalar), offset(other.offset),
-      bucket_count(other.bucket_count), type(other.type) {
-    if (type == Type::kLinear) {
-        internal::LoadLinear(this);
-    } else {
-        internal::LoadExponential(this);
-    }
-}
+HistogramOptions::HistogramOptions(const HistogramOptions&) = default;
 
 HistogramOptions HistogramOptions::Exponential(uint32_t bucket_count, uint32_t base,
                                                uint32_t scalar, int64_t offset) {

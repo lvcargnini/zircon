@@ -35,7 +35,8 @@ public:
 
     // Creates a ProxyDevice to be a child platform device or a proxy client device.
     static zx_status_t CreateChild(zx_device_t* parent, uint32_t device_id,
-                                   fbl::RefPtr<PlatformProxy> proxy, const device_add_args_t* args);
+                                   fbl::RefPtr<PlatformProxy> proxy, const device_add_args_t* args,
+                                   zx_device_t** device);
 
     // Full device protocol implementation.
     // For child devices, these call through to the device protocol passed via pdev_device_add().
@@ -60,6 +61,7 @@ public:
                             size_t* out_size, zx_paddr_t* out_paddr, zx_handle_t* out_handle);
     zx_status_t PDevGetInterrupt(uint32_t index, uint32_t flags, zx_handle_t* out_handle);
     zx_status_t PDevGetBti(uint32_t index, zx_handle_t* out_handle);
+    zx_status_t PDevGetSmc(uint32_t index, zx_handle_t* out_handle);
     zx_status_t PDevGetDeviceInfo(pdev_device_info_t* out_info);
     zx_status_t PDevGetBoardInfo(pdev_board_info_t* out_info);
     zx_status_t PDevDeviceAdd(uint32_t index, const device_add_args_t* args, zx_device_t** device);
@@ -110,7 +112,7 @@ private:
 
     zx_status_t InitCommon();
     zx_status_t InitRoot();
-    zx_status_t InitChild(const device_add_args_t* args);
+    zx_status_t InitChild(const device_add_args_t* args, zx_device_t** device);
 
     DISALLOW_COPY_ASSIGN_AND_MOVE(ProxyDevice);
 

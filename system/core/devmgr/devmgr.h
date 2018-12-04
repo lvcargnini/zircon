@@ -9,6 +9,9 @@
 #include <fbl/function.h>
 #include <launchpad/launchpad.h>
 #include <lib/zx/channel.h>
+#include <lib/zx/job.h>
+#include <lib/zx/process.h>
+#include <lib/zx/vmo.h>
 #include <zircon/compiler.h>
 #include <zircon/types.h>
 #include <zircon/device/vfs.h>
@@ -17,12 +20,12 @@ namespace devmgr {
 
 void coordinator();
 
-void devfs_init(zx_handle_t root_job);
+void devfs_init(const zx::job& root_job);
 
 void devmgr_io_init();
 void devmgr_svc_init();
 void devmgr_vfs_init();
-void devmgr_set_bootdata(zx_handle_t vmo);
+void devmgr_set_bootdata(zx::unowned_vmo vmo);
 
 zx_handle_t devmgr_load_file(const char* path, uint32_t* out_size);
 
@@ -48,19 +51,19 @@ zx_handle_t devmgr_load_file(const char* path, uint32_t* out_size);
     ZX_FS_FLAG_DIRECTORY | ZX_FS_FLAG_NOREMOTE)
 
 zx_status_t devmgr_launch(
-    zx_handle_t job, const char* name,
+    const zx::job& job, const char* name,
     zx_status_t (*load)(void* ctx, launchpad_t*, const char* file), void* ctx,
     int argc, const char* const* argv,
     const char** envp, int stdiofd,
     const zx_handle_t* handles, const uint32_t* types, size_t hcount,
-    zx_handle_t* proc_out, uint32_t flags);
+    zx::process* proc_out, uint32_t flags);
 zx_status_t devmgr_launch_load(void* ctx, launchpad_t* lp, const char* file);
 zx_status_t devmgr_launch_cmdline(
-    const char* me, zx_handle_t job, const char* name,
+    const char* me, const zx::job& job, const char* name,
     zx_status_t (*load)(void* ctx, launchpad_t*, const char* file), void* ctx,
     const char* cmdline,
     const zx_handle_t* handles, const uint32_t* types, size_t hcount,
-    zx_handle_t* proc_out, uint32_t flags);
+    zx::process* proc_out, uint32_t flags);
 bool secondary_bootfs_ready();
 
 #define FSHOST_SIGNAL_READY      ZX_USER_SIGNAL_0  // Signalled by fshost
@@ -71,7 +74,7 @@ void bootfs_create_from_startup_handle();
 void fshost_start();
 zx_status_t copy_vmo(zx_handle_t src, zx_off_t offset, size_t length, zx_handle_t* out_dest);
 
-zx_handle_t get_sysinfo_job_root();
+zx::job get_sysinfo_job_root();
 
 void load_system_drivers();
 
@@ -83,12 +86,20 @@ void devmgr_disable_appmgr_services();
 // The env var to set to enable ld.so tracing.
 #define LDSO_TRACE_ENV "LD_TRACE=1"
 
-zx_handle_t devfs_root_clone();
-zx::channel fs_clone(const char* path);
+// Borrows the channel connected to the root of devfs.
+zx::unowned_channel devfs_root_borrow();
 
-// Function which mounts a handle on behalf of the block watcher.
-using FsInstallerFn = fbl::Function<zx_status_t(const char* path, zx_handle_t h)>;
-void block_device_watcher(FsInstallerFn install_callback, zx_handle_t job, bool netboot);
+// Clones the channel connected to the root of devfs.
+zx::channel devfs_root_clone();
+
+// Opens a path relative to locally-specified roots.
+//
+// This acts similar to 'open', but avoids utilizing the local process' namespace.
+// Instead, it manually translates hardcoded paths, such as "svc", "dev", etc into
+// their corresponding root connection, where the request is forwarded.
+//
+// This function is implemented by both devmgr and fshost.
+zx::channel fs_clone(const char* path);
 
 // getenv_bool looks in the environment for name. If not found, it returns
 // default. If found, it returns false if the found value matches "0", "off", or

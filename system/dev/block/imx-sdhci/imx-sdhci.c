@@ -20,6 +20,7 @@
 #include <ddk/mmio-buffer.h>
 #include <ddk/phys-iter.h>
 #include <ddk/platform-defs.h>
+#include <ddk/protocol/block.h>
 #include <ddk/protocol/gpio.h>
 #include <ddk/protocol/platform-device.h>
 #include <ddk/protocol/platform-device-lib.h>
@@ -27,6 +28,7 @@
 #include <ddk/protocol/sdmmc.h>
 #include <ddk/protocol/sdhci.h>
 #include <hw/reg.h>
+#include <hw/sdhci.h>
 #include <hw/sdmmc.h>
 #include <zircon/types.h>
 

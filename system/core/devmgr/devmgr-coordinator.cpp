@@ -24,17 +24,20 @@
 #include <zircon/boot/bootdata.h>
 #include <lib/fdio/io.h>
 #include <lib/zircon-internal/ktrace.h>
+#include <lib/zx/job.h>
+#include <lib/zx/socket.h>
 
 #include "devcoordinator.h"
 #include "devhost.h"
+#include "devhost-shared.h"
 #include "devmgr.h"
 #include "log.h"
-#include "memfs-private.h"
+#include "fshost.h"
 
 namespace devmgr {
 
-static void dc_driver_added(driver_t* drv, const char* version);
-static void dc_driver_added_init(driver_t* drv, const char* version);
+static void dc_driver_added(Driver* drv, const char* version);
+static void dc_driver_added_init(Driver* drv, const char* version);
 
 
 #define BOOT_FIRMWARE_DIR "/boot/lib/firmware"
@@ -47,51 +50,61 @@ uint32_t log_flags = LOG_ERROR | LOG_INFO;
 bool dc_asan_drivers = false;
 bool dc_launched_first_devhost = false;
 
-static zx_handle_t bootdata_vmo;
+static zx::vmo bootdata_vmo;
 
 static void dc_dump_state();
 static void dc_dump_devprops();
 static void dc_dump_drivers();
 
-typedef struct {
+struct SuspendContext {
+    SuspendContext() = default;
+    ~SuspendContext() {
+        devhosts.clear();
+    }
+
+    SuspendContext(SuspendContext&&) = default;
+    SuspendContext& operator=(SuspendContext&&) = default;
+
     zx_status_t status;
     enum struct Flags : uint32_t {
         kRunning = 0u,
         kSuspend = 1u,
-    } flags;
-    uint32_t sflags;    // suspend flags
-    uint32_t count;     // outstanding msgs
-    devhost_t* dh;      // next devhost to process
-    list_node_t devhosts;
+    } flags = Flags::kRunning;;
 
-    zx_handle_t socket; // socket to notify on for 'dm reboot' and 'dm poweroff'
+    // suspend flags
+    uint32_t sflags = 0u;
+    // outstanding msgs
+    uint32_t count = 0u;
+    // next devhost to process
+    Devhost* dh = nullptr;
+    fbl::DoublyLinkedList<Devhost*, Devhost::SuspendNode> devhosts;
+
+    // socket to notify on for 'dm reboot' and 'dm poweroff'
+    zx::socket socket;
 
     // mexec arguments
-    zx_handle_t kernel;
-    zx_handle_t bootdata;
-} suspend_context_t;
-static suspend_context_t suspend_ctx = []() {
-    suspend_context_t suspend = {};
-    suspend.devhosts = LIST_INITIAL_VALUE(suspend_ctx.devhosts);
-    return suspend;
-}();
+    zx_handle_t kernel = ZX_HANDLE_INVALID;
+    zx_handle_t bootdata = ZX_HANDLE_INVALID;
+};
 
-static fbl::DoublyLinkedList<fbl::unique_ptr<dc_metadata_t>, dc_metadata_t::Node> published_metadata;
+static SuspendContext suspend_ctx;
+
+static fbl::DoublyLinkedList<fbl::unique_ptr<Metadata>, Metadata::Node> published_metadata;
 
 static bool dc_in_suspend() {
-    return suspend_ctx.flags == suspend_context_t::Flags::kSuspend;
+    return suspend_ctx.flags == SuspendContext::Flags::kSuspend;
 }
 static void dc_suspend(uint32_t flags);
 static void dc_mexec(zx_handle_t* h);
-static void dc_continue_suspend(suspend_context_t* ctx);
+static void dc_continue_suspend(SuspendContext* ctx);
 
 static bool suspend_fallback = false;
 static bool suspend_debug = false;
 
-static device_t root_device;
-static device_t misc_device;
-static device_t sys_device;
-static device_t test_device;
+static Device root_device;
+static Device misc_device;
+static Device sys_device;
+static Device test_device;
 
 static zx_status_t initialize_core_devices() {
     {
@@ -166,10 +179,10 @@ static zx_status_t initialize_core_devices() {
     return ZX_OK;
 }
 
-static zx_handle_t dmctl_socket;
+static zx::socket dmctl_socket;
 
 static void dmprintf(const char* fmt, ...) {
-    if (dmctl_socket == ZX_HANDLE_INVALID) {
+    if (!dmctl_socket.is_valid()) {
         return;
     }
     char buf[1024];
@@ -178,9 +191,8 @@ static void dmprintf(const char* fmt, ...) {
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
     size_t actual;
-    if (zx_socket_write(dmctl_socket, 0, buf, strlen(buf), &actual) < 0) {
-        zx_handle_close(dmctl_socket);
-        dmctl_socket = ZX_HANDLE_INVALID;
+    if (dmctl_socket.write(0, buf, strlen(buf), &actual) != ZX_OK) {
+        dmctl_socket.reset();
     }
 }
 
@@ -274,31 +286,32 @@ static zx_status_t handle_dmctl_write(size_t len, const char* cmd) {
 }
 
 static zx_status_t dc_handle_device(port_handler_t* ph, zx_signals_t signals, uint32_t evt);
-static zx_status_t dc_attempt_bind(const driver_t* drv, device_t* dev);
+static zx_status_t dc_attempt_bind(const Driver* drv, Device* dev);
 
 static bool dc_running;
 
-static zx_handle_t dc_watch_channel;
+static zx::channel dc_watch_channel;
 
-static zx_handle_t devhost_job;
+static zx::job devhost_job;
+
 port_t dc_port;
 
 // All Drivers
-static fbl::DoublyLinkedList<driver_t*, driver_t::Node> list_drivers;
+static fbl::DoublyLinkedList<Driver*, Driver::Node> list_drivers;
 
 // Drivers to add to All Drivers
-static fbl::DoublyLinkedList<driver_t*, driver_t::Node> list_drivers_new;
+static fbl::DoublyLinkedList<Driver*, Driver::Node> list_drivers_new;
 
 // Drivers to try last
-static fbl::DoublyLinkedList<driver_t*, driver_t::Node> list_drivers_fallback;
+static fbl::DoublyLinkedList<Driver*, Driver::Node> list_drivers_fallback;
 
 // All Devices (excluding static immortal devices)
-static fbl::DoublyLinkedList<dc_device*, dc_device::AllDevicesNode> list_devices;
+static fbl::DoublyLinkedList<Device*, Device::AllDevicesNode> list_devices;
 
 // All DevHosts
-static fbl::DoublyLinkedList<dc_devhost*, dc_devhost::AllDevhostsNode> list_devhosts;
+static fbl::DoublyLinkedList<Devhost*, Devhost::AllDevhostsNode> list_devhosts;
 
-static const driver_t* libname_to_driver(const char* libname) {
+static const Driver* libname_to_driver(const char* libname) {
     for (const auto& drv : list_drivers) {
         if (!strcmp(libname, drv.libname.c_str())) {
             return &drv;
@@ -307,13 +320,14 @@ static const driver_t* libname_to_driver(const char* libname) {
     return nullptr;
 }
 
-static zx_status_t load_vmo(const char* libname, zx_handle_t* out) {
+static zx_status_t load_vmo(const char* libname, zx::vmo* out_vmo) {
     int fd = open(libname, O_RDONLY);
     if (fd < 0) {
         log(ERROR, "devcoord: cannot open driver '%s'\n", libname);
         return ZX_ERR_IO;
     }
-    zx_status_t r = fdio_get_vmo_clone(fd, out);
+    zx::vmo vmo;
+    zx_status_t r = fdio_get_vmo_clone(fd, vmo.reset_and_get_address());
     close(fd);
     if (r < 0) {
         log(ERROR, "devcoord: cannot get driver vmo '%s'\n", libname);
@@ -324,12 +338,13 @@ static zx_status_t load_vmo(const char* libname, zx_handle_t* out) {
     } else {
         vmo_name = libname;
     }
-    zx_object_set_property(*out, ZX_PROP_NAME, vmo_name, strlen(vmo_name));
+    vmo.set_property(ZX_PROP_NAME, vmo_name, strlen(vmo_name));
+    *out_vmo = fbl::move(vmo);
     return r;
 }
 
-static zx_status_t libname_to_vmo(const char* libname, zx_handle_t* out) {
-    const driver_t* drv = libname_to_driver(libname);
+static zx_status_t libname_to_vmo(const char* libname, zx::vmo* out_vmo) {
+    const Driver* drv = libname_to_driver(libname);
     if (drv == nullptr) {
         log(ERROR, "devcoord: cannot find driver '%s'\n", libname);
         return ZX_ERR_NOT_FOUND;
@@ -337,27 +352,27 @@ static zx_status_t libname_to_vmo(const char* libname, zx_handle_t* out) {
 
     // Check for cached DSO
     if (drv->dso_vmo != ZX_HANDLE_INVALID) {
-        zx_status_t r = zx_handle_duplicate(drv->dso_vmo,
-                                            ZX_RIGHTS_BASIC | ZX_RIGHTS_PROPERTY |
-                                            ZX_RIGHT_READ | ZX_RIGHT_EXECUTE | ZX_RIGHT_MAP,
-                                            out);
+        zx_status_t r = drv->dso_vmo.duplicate(ZX_RIGHTS_BASIC | ZX_RIGHTS_PROPERTY |
+                                               ZX_RIGHT_READ | ZX_RIGHT_EXECUTE | ZX_RIGHT_MAP,
+                                               out_vmo);
         if (r != ZX_OK) {
             log(ERROR, "devcoord: cannot duplicate cached dso for '%s' '%s'\n", drv->name.c_str(),
                 libname);
         }
         return r;
     } else {
-        return load_vmo(libname, out);
+        return load_vmo(libname, out_vmo);
     }
 }
 
-void devmgr_set_bootdata(zx_handle_t vmo) {
-    if (bootdata_vmo == ZX_HANDLE_INVALID) {
-        zx_handle_duplicate(vmo, ZX_RIGHT_SAME_RIGHTS, &bootdata_vmo);
+void devmgr_set_bootdata(const zx::unowned_vmo vmo) {
+    if (bootdata_vmo.is_valid()) {
+        return;
     }
+    vmo->duplicate(ZX_RIGHT_SAME_RIGHTS, &bootdata_vmo);
 }
 
-static void dc_dump_device(const device_t* dev, size_t indent) {
+static void dc_dump_device(const Device* dev, size_t indent) {
     zx_koid_t pid = dev->host ? dev->host->koid : 0;
     char extra[256];
     if (log_flags & LOG_DEVLC) {
@@ -392,7 +407,7 @@ static void dc_dump_state() {
     dc_dump_device(&test_device, 1);
 }
 
-static void dc_dump_device_props(const device_t* dev) {
+static void dc_dump_device_props(const Device* dev) {
     if (dev->host) {
         dmprintf("Name [%s]%s%s%s\n",
                  dev->name,
@@ -471,36 +486,36 @@ static void dc_dump_drivers() {
     }
 }
 
-static void dc_handle_new_device(device_t* dev);
+static void dc_handle_new_device(Device* dev);
 static void dc_handle_new_driver();
 
-static fbl::DoublyLinkedList<dc_work*, dc_work::Node> list_pending_work;
+static fbl::DoublyLinkedList<Work*, Work::Node> list_pending_work;
 
-static void queue_work(work_t* work, dc_work::Op op, uint32_t arg) {
-    ZX_ASSERT(work->op == dc_work::Op::kIdle);
+static void queue_work(Work* work, Work::Op op, uint32_t arg) {
+    ZX_ASSERT(work->op == Work::Op::kIdle);
     work->op = op;
     work->arg = arg;
     list_pending_work.push_back(work);
 }
 
-static void cancel_work(work_t* work) {
-    if (work->op != dc_work::Op::kIdle) {
+static void cancel_work(Work* work) {
+    if (work->op != Work::Op::kIdle) {
         list_pending_work.erase(*work);
-        work->op = dc_work::Op::kIdle;
+        work->op = Work::Op::kIdle;
     }
 }
 
-static void process_work(work_t* work) {
-    dc_work::Op op = work->op;
-    work->op = dc_work::Op::kIdle;
+static void process_work(Work* work) {
+    Work::Op op = work->op;
+    work->op = Work::Op::kIdle;
 
     switch (op) {
-    case dc_work::Op::kDeviceAdded: {
-        device_t* dev = containerof(work, device_t, work);
+    case Work::Op::kDeviceAdded: {
+        Device* dev = containerof(work, Device, work);
         dc_handle_new_device(dev);
         break;
     }
-    case dc_work::Op::kDriverAdded: {
+    case Work::Op::kDriverAdded: {
         dc_handle_new_driver();
         break;
     }
@@ -523,7 +538,7 @@ static const char* get_devhost_bin() {
 
 zx_handle_t get_service_root();
 
-static zx_status_t dc_get_topo_path(const device_t* dev, char* out, size_t max) {
+static zx_status_t dc_get_topo_path(const Device* dev, char* out, size_t max) {
     char tmp[max];
     char* path = tmp + max - 1;
     *path = 0;
@@ -562,7 +577,7 @@ static zx_status_t dc_get_topo_path(const device_t* dev, char* out, size_t max) 
 }
 
 //TODO: use a better device identifier
-static zx_status_t dc_notify(const device_t* dev, uint32_t op) {
+static zx_status_t dc_notify(const Device* dev, uint32_t op) {
     if (dc_watch_channel == ZX_HANDLE_INVALID) {
         return ZX_ERR_BAD_STATE;
     }
@@ -587,7 +602,7 @@ static zx_status_t dc_notify(const device_t* dev, uint32_t op) {
         evt->u.add.protocol_id = dev->protocol_id;
         evt->u.add.props_len = static_cast<uint32_t>(propslen);
         evt->u.add.path_len = static_cast<uint32_t>(pathlen);
-        r = zx_channel_write(dc_watch_channel, 0, msg, static_cast<uint32_t>(len), nullptr, 0);
+        r = dc_watch_channel.write(0, msg, static_cast<uint32_t>(len), nullptr, 0);
     } else {
         devmgr_event_t evt;
         memset(&evt, 0, sizeof(evt));
@@ -596,20 +611,17 @@ static zx_status_t dc_notify(const device_t* dev, uint32_t op) {
             evt.flags |= DEVMGR_FLAGS_BOUND;
         }
         evt.id = (uintptr_t) dev;
-        r = zx_channel_write(dc_watch_channel, 0, &evt, sizeof(evt), nullptr, 0);
+        r = dc_watch_channel.write(0, &evt, sizeof(evt), nullptr, 0);
     }
     if (r < 0) {
-        zx_handle_close(dc_watch_channel);
-        dc_watch_channel = ZX_HANDLE_INVALID;
+        dc_watch_channel.reset();
     }
     return r;
 }
 
 static void dc_watch(zx_handle_t h) {
-    if (dc_watch_channel != ZX_HANDLE_INVALID) {
-        zx_handle_close(dc_watch_channel);
-    }
-    dc_watch_channel = h;
+    dc_watch_channel.reset(h);
+
     for (const auto& dev : list_devices) {
         if (dev.flags & (DEV_CTX_DEAD | DEV_CTX_ZOMBIE)) {
             // if device is dead, ignore it
@@ -621,12 +633,12 @@ static void dc_watch(zx_handle_t h) {
     }
 }
 
-static zx_status_t dc_launch_devhost(devhost_t* host,
+static zx_status_t dc_launch_devhost(Devhost* host,
                                      const char* name, zx_handle_t hrpc) {
     const char* devhost_bin = get_devhost_bin();
 
     launchpad_t* lp;
-    launchpad_create_with_jobs(devhost_job, 0, name, &lp);
+    launchpad_create_with_jobs(devhost_job.get(), 0, name, &lp);
     launchpad_load_from_file(lp, devhost_bin);
     launchpad_set_args(lp, 1, &devhost_bin);
 
@@ -655,19 +667,18 @@ static zx_status_t dc_launch_devhost(devhost_t* host,
     launchpad_set_nametable(lp, name_count, nametable);
 
     //TODO: limit root job access to root devhost only
-    launchpad_add_handle(lp, get_sysinfo_job_root(),
+    launchpad_add_handle(lp, get_sysinfo_job_root().release(),
                          PA_HND(PA_USER0, ID_HJOBROOT));
 
     const char* errmsg;
-    zx_status_t status = launchpad_go(lp, &host->proc, &errmsg);
+    zx_status_t status = launchpad_go(lp, host->proc.reset_and_get_address(), &errmsg);
     if (status < 0) {
         log(ERROR, "devcoord: launch devhost '%s': failed: %d: %s\n",
             name, status, errmsg);
         return status;
     }
     zx_info_handle_basic_t info;
-    if (zx_object_get_info(host->proc, ZX_INFO_HANDLE_BASIC, &info,
-                           sizeof(info), nullptr, nullptr) == ZX_OK) {
+    if (host->proc.get_info(ZX_INFO_HANDLE_BASIC, &info, sizeof(info), nullptr, nullptr) == ZX_OK) {
         host->koid = info.koid;
     }
     log(INFO, "devcoord: launch devhost '%s': pid=%zu\n",
@@ -678,14 +689,14 @@ static zx_status_t dc_launch_devhost(devhost_t* host,
     return ZX_OK;
 }
 
-dc_devhost::dc_devhost()
+Devhost::Devhost()
     : ph({}), hrpc(ZX_HANDLE_INVALID), proc(ZX_HANDLE_INVALID), koid(0), refcount_(0),
       flags(0), parent(nullptr), anode({}), snode({}), node({}) {
 }
 
-static zx_status_t dc_new_devhost(const char* name, devhost_t* parent,
-                                  devhost_t** out) {
-    auto dh = fbl::make_unique<devhost_t>();
+static zx_status_t dc_new_devhost(const char* name, Devhost* parent,
+                                  Devhost** out) {
+    auto dh = fbl::make_unique<Devhost>();
     if (dh == nullptr) {
         return ZX_ERR_NO_MEMORY;
     }
@@ -714,12 +725,12 @@ static zx_status_t dc_new_devhost(const char* name, devhost_t* parent,
     return ZX_OK;
 }
 
-static void dc_release_devhost(devhost_t* dh) {
+static void dc_release_devhost(Devhost* dh) {
     if (!dh->Release()) {
         return;
     }
     log(INFO, "devcoord: destroy host %p\n", dh);
-    devhost_t* parent = dh->parent;
+    Devhost* parent = dh->parent;
     if (parent != nullptr) {
         dh->parent->children.erase(*dh);
         dh->parent = nullptr;
@@ -727,13 +738,12 @@ static void dc_release_devhost(devhost_t* dh) {
     }
     list_devhosts.erase(*dh);
     zx_handle_close(dh->hrpc);
-    zx_task_kill(dh->proc);
-    zx_handle_close(dh->proc);
+    dh->proc.kill();
     delete dh;
 }
 
 // called when device children or proxys are removed
-static void dc_release_device(device_t* dev) {
+static void dc_release_device(Device* dev) {
     log(DEVLC, "devcoord: release dev %p name='%s' ref=%d\n", dev, dev->name, dev->refcount_);
 
     if (!dev->Release()) {
@@ -758,7 +768,7 @@ static void dc_release_device(device_t* dev) {
 
     cancel_work(&dev->work);
 
-    fbl::unique_ptr<dc_metadata_t> md;
+    fbl::unique_ptr<Metadata> md;
     while ((md = dev->metadata.pop_front()) != nullptr) {
         if (md->has_path) {
             // return to published_metadata list
@@ -773,14 +783,14 @@ static void dc_release_device(device_t* dev) {
     delete dev;
 }
 
-dc_device::dc_device()
+Device::Device()
     : hrpc(ZX_HANDLE_INVALID), flags(0), ph({}), host(nullptr),
       name(nullptr), libname(nullptr), work({}), refcount_(0), protocol_id(0), prop_count(0),
       self(nullptr), link(nullptr), parent(nullptr), proxy(nullptr), node({}), dhnode({}),
       anode({}) {
 }
 
-dc_device::~dc_device() {
+Device::~Device() {
     // TODO: cancel any pending rpc responses.  This clear is a hack to prevent
     // pending's dtor from asserting.
     pending.clear();
@@ -789,15 +799,15 @@ dc_device::~dc_device() {
 // Add a new device to a parent device (same devhost)
 // New device is published in devfs.
 // Caller closes handles on error, so we don't have to.
-static zx_status_t dc_add_device(device_t* parent, zx_handle_t hrpc,
-                                 dc_msg_t* msg, const char* name,
+static zx_status_t dc_add_device(Device* parent, zx_handle_t hrpc,
+                                 Message* msg, const char* name,
                                  const char* args, const void* data,
                                  bool invisible) {
     if (msg->datalen % sizeof(zx_device_prop_t)) {
         return ZX_ERR_INVALID_ARGS;
     }
 
-    auto dev = fbl::make_unique<device_t>();
+    auto dev = fbl::make_unique<Device>();
     if (!dev) {
         return ZX_ERR_NO_MEMORY;
     }
@@ -893,7 +903,7 @@ static zx_status_t dc_add_device(device_t* parent, zx_handle_t hrpc,
 
     if (!invisible) {
         dc_notify(dev.get(), DEVMGR_OP_DEVICE_ADDED);
-        queue_work(&dev->work, dc_work::Op::kDeviceAdded, 0);
+        queue_work(&dev->work, Work::Op::kDeviceAdded, 0);
     }
     // TODO(teisenbe/kulakowski): This should go away once we switch to refptrs
     // here
@@ -901,7 +911,7 @@ static zx_status_t dc_add_device(device_t* parent, zx_handle_t hrpc,
     return ZX_OK;
 }
 
-static zx_status_t dc_make_visible(device_t* dev) {
+static zx_status_t dc_make_visible(Device* dev) {
     if (dev->flags & DEV_CTX_DEAD) {
         return ZX_ERR_BAD_STATE;
     }
@@ -909,7 +919,7 @@ static zx_status_t dc_make_visible(device_t* dev) {
         dev->flags &= ~DEV_CTX_INVISIBLE;
         devfs_advertise(dev);
         dc_notify(dev, DEVMGR_OP_DEVICE_ADDED);
-        queue_work(&dev->work, dc_work::Op::kDeviceAdded, 0);
+        queue_work(&dev->work, Work::Op::kDeviceAdded, 0);
     }
     return ZX_OK;
 }
@@ -918,7 +928,7 @@ static zx_status_t dc_make_visible(device_t* dev) {
 // forced indicates this is removal due to a channel close
 // or process exit, which means we should remove all other
 // devices that share the devhost at the same time
-static zx_status_t dc_remove_device(device_t* dev, bool forced) {
+static zx_status_t dc_remove_device(Device* dev, bool forced) {
     if (dev->flags & DEV_CTX_ZOMBIE) {
         // This device was removed due to its devhost dying
         // (process exit or some other channel on that devhost
@@ -945,14 +955,14 @@ static zx_status_t dc_remove_device(device_t* dev, bool forced) {
     devfs_unpublish(dev);
 
     if (dev->proxy) {
-        dc_msg_t msg;
+        Message msg;
         uint32_t mlen;
         zx_status_t r;
         if ((r = dc_msg_pack(&msg, &mlen, nullptr, 0, nullptr, nullptr)) < 0) {
             log(ERROR, "devcoord: dc_msg_pack failed in dc_remove_device\n");
         } else {
             msg.txid = 0;
-            msg.op = dc_msg_t::Op::kRemoveDevice;
+            msg.op = Message::Op::kRemoveDevice;
             if ((r = zx_channel_write(dev->proxy->hrpc, 0, &msg, mlen, nullptr, 0)) != ZX_OK) {
             log(ERROR, "devcoord: zx_channel_write failed in dc_remove_devicey\n");
             }
@@ -960,7 +970,7 @@ static zx_status_t dc_remove_device(device_t* dev, bool forced) {
     }
 
     // detach from devhost
-    devhost_t* dh = dev->host;
+    Devhost* dh = dev->host;
     if (dh != nullptr) {
         dev->host->devices.erase(*dev);
         dev->host = nullptr;
@@ -972,8 +982,8 @@ static zx_status_t dc_remove_device(device_t* dev, bool forced) {
         if (forced) {
             dh->flags |= DEV_HOST_DYING;
 
-            device_t* next;
-            device_t* last = nullptr;
+            Device* next;
+            Device* last = nullptr;
             while (!dh->devices.is_empty()) {
                 next = &dh->devices.front();
                 if (last == next) {
@@ -993,7 +1003,7 @@ static zx_status_t dc_remove_device(device_t* dev, bool forced) {
     }
 
     // if we have a parent, disconnect and downref it
-    device_t* parent = dev->parent;
+    Device* parent = dev->parent;
     if (parent != nullptr) {
         dev->parent = nullptr;
         if (dev->flags & DEV_CTX_PROXY) {
@@ -1021,7 +1031,7 @@ static zx_status_t dc_remove_device(device_t* dev, bool forced) {
                         parent, parent->name);
 
                     //TODO: introduce timeout, exponential backoff
-                    queue_work(&parent->work, dc_work::Op::kDeviceAdded, 0);
+                    queue_work(&parent->work, Work::Op::kDeviceAdded, 0);
                 }
             }
         }
@@ -1047,7 +1057,7 @@ static zx_status_t dc_remove_device(device_t* dev, bool forced) {
     return ZX_OK;
 }
 
-static zx_status_t dc_bind_device(device_t* dev, const char* drvlibname) {
+static zx_status_t dc_bind_device(Device* dev, const char* drvlibname) {
      log(INFO, "devcoord: dc_bind_device() '%s'\n", drvlibname);
 
     // shouldn't be possible to get a bind request for a proxy device
@@ -1081,12 +1091,17 @@ static zx_status_t dc_bind_device(device_t* dev, const char* drvlibname) {
     return ZX_OK;
 };
 
-static zx_status_t dc_load_firmware(device_t* dev, const char* path,
+static zx_status_t dc_load_firmware(Device* dev, const char* path,
                                     zx_handle_t* vmo, size_t* size) {
     static const char* fwdirs[] = {
         BOOT_FIRMWARE_DIR,
         SYSTEM_FIRMWARE_DIR,
     };
+
+    // Must be a relative path and no funny business.
+    if (path[0] == '/' || path[0] == '.') {
+        return ZX_ERR_INVALID_ARGS;
+    }
 
     int fd, fwfd;
     for (unsigned n = 0; n < fbl::count_of(fwdirs); n++) {
@@ -1115,10 +1130,10 @@ static bool path_is_child(const char* parent_path, const char* child_path) {
         (child_path[parent_length] == 0 || child_path[parent_length] == '/'));
 }
 
-static zx_status_t dc_get_metadata(device_t* dev, uint32_t type, void* buffer, size_t buflen,
+static zx_status_t dc_get_metadata(Device* dev, uint32_t type, void* buffer, size_t buflen,
                                    size_t* actual) {
     // search dev and its parent devices for a match
-    device_t* test = dev;
+    Device* test = dev;
     while (test) {
         for (const auto& md : test->metadata) {
             if (md.type == type) {
@@ -1155,10 +1170,10 @@ static zx_status_t dc_get_metadata(device_t* dev, uint32_t type, void* buffer, s
     return ZX_ERR_NOT_FOUND;
 }
 
-static zx_status_t dc_add_metadata(device_t* dev, uint32_t type, const void* data,
+static zx_status_t dc_add_metadata(Device* dev, uint32_t type, const void* data,
                                    uint32_t length) {
-    fbl::unique_ptr<dc_metadata_t> md;
-    zx_status_t status = dc_metadata_t::Create(length, &md);
+    fbl::unique_ptr<Metadata> md;
+    zx_status_t status = Metadata::Create(length, &md);
     if (status != ZX_OK) {
         return status;
     }
@@ -1170,7 +1185,7 @@ static zx_status_t dc_add_metadata(device_t* dev, uint32_t type, const void* dat
     return ZX_OK;
 }
 
-static zx_status_t dc_publish_metadata(device_t* dev, const char* path, uint32_t type,
+static zx_status_t dc_publish_metadata(Device* dev, const char* path, uint32_t type,
                                        const void* data, uint32_t length) {
     char caller_path[DC_PATH_MAX];
     zx_status_t status = dc_get_topo_path(dev, caller_path, DC_PATH_MAX);
@@ -1195,8 +1210,8 @@ static zx_status_t dc_publish_metadata(device_t* dev, const char* path, uint32_t
         }
     }
 
-    fbl::unique_ptr<dc_metadata_t> md;
-    status = dc_metadata_t::Create(length + strlen(path) + 1, &md);
+    fbl::unique_ptr<Metadata> md;
+    status = Metadata::Create(length + strlen(path) + 1, &md);
     if (status != ZX_OK) {
         return status;
     }
@@ -1210,8 +1225,8 @@ static zx_status_t dc_publish_metadata(device_t* dev, const char* path, uint32_t
     return ZX_OK;
 }
 
-static zx_status_t dc_handle_device_read(device_t* dev) {
-    dc_msg_t msg;
+static zx_status_t dc_handle_device_read(Device* dev) {
+    Message msg;
     zx_handle_t hin[3];
     uint32_t msize = sizeof(msg);
     uint32_t hcount = 3;
@@ -1237,12 +1252,12 @@ static zx_status_t dc_handle_device_read(device_t* dev) {
         return ZX_ERR_INTERNAL;
     }
 
-    dc_status_t dcs;
+    Status dcs;
     dcs.txid = msg.txid;
 
     switch (msg.op) {
-    case dc_msg_t::Op::kAddDevice:
-    case dc_msg_t::Op::kAddDeviceInvisible:
+    case Message::Op::kAddDevice:
+    case Message::Op::kAddDeviceInvisible:
         if (hcount != 1) {
             goto fail_wrong_hcount;
         }
@@ -1254,12 +1269,12 @@ static zx_status_t dc_handle_device_read(device_t* dev) {
         }
         log(RPC_IN, "devcoord: rpc: add-device '%s' args='%s'\n", name, args);
         if ((r = dc_add_device(dev, hin[0], &msg, name, args, data,
-                               msg.op == dc_msg_t::Op::kAddDeviceInvisible)) < 0) {
+                               msg.op == Message::Op::kAddDeviceInvisible)) < 0) {
             zx_handle_close(hin[0]);
         }
         break;
 
-    case dc_msg_t::Op::kRemoveDevice:
+    case Message::Op::kRemoveDevice:
         if (hcount != 0) {
             goto fail_wrong_hcount;
         }
@@ -1273,7 +1288,7 @@ static zx_status_t dc_handle_device_read(device_t* dev) {
         dc_remove_device(dev, false);
         goto disconnect;
 
-    case dc_msg_t::Op::kMakeVisible:
+    case Message::Op::kMakeVisible:
         if (hcount != 0) {
             goto fail_wrong_hcount;
         }
@@ -1288,7 +1303,7 @@ static zx_status_t dc_handle_device_read(device_t* dev) {
         r = ZX_OK;
         break;
 
-    case dc_msg_t::Op::kBindDevice:
+    case Message::Op::kBindDevice:
         if (hcount != 0) {
             goto fail_wrong_hcount;
         }
@@ -1302,21 +1317,18 @@ static zx_status_t dc_handle_device_read(device_t* dev) {
         r = dc_bind_device(dev, args);
         break;
 
-    case dc_msg_t::Op::kDmCommand:
+    case Message::Op::kDmCommand:
         if (hcount > 1) {
             goto fail_wrong_hcount;
         }
         if (hcount == 1) {
-            dmctl_socket = hin[0];
+            dmctl_socket.reset(hin[0]);
         }
         r = handle_dmctl_write(msg.datalen, static_cast<const char*>(data));
-        if (dmctl_socket != ZX_HANDLE_INVALID) {
-            zx_handle_close(dmctl_socket);
-            dmctl_socket = ZX_HANDLE_INVALID;
-        }
+        dmctl_socket.reset();
         break;
 
-    case dc_msg_t::Op::kDmOpenVirtcon:
+    case Message::Op::kDmOpenVirtcon:
         if (hcount != 1) {
             goto fail_wrong_hcount;
         }
@@ -1324,7 +1336,7 @@ static zx_status_t dc_handle_device_read(device_t* dev) {
         r = ZX_OK;
         break;
 
-    case dc_msg_t::Op::kDmWatch:
+    case Message::Op::kDmWatch:
         if (hcount != 1) {
             goto fail_wrong_hcount;
         }
@@ -1332,7 +1344,7 @@ static zx_status_t dc_handle_device_read(device_t* dev) {
         r = ZX_OK;
         break;
 
-    case dc_msg_t::Op::kDmMexec:
+    case Message::Op::kDmMexec:
         if (hcount != 2) {
             log(ERROR, "devcoord: rpc: mexec wrong hcount %d\n", hcount);
             goto fail_wrong_hcount;
@@ -1341,12 +1353,12 @@ static zx_status_t dc_handle_device_read(device_t* dev) {
         r = ZX_OK;
         break;
 
-    case dc_msg_t::Op::kGetTopoPath: {
+    case Message::Op::kGetTopoPath: {
         if (hcount != 0) {
             goto fail_wrong_hcount;
         }
         struct {
-            dc_status_t rsp;
+            Status rsp;
             char path[DC_PATH_MAX];
         } reply;
         if ((r = dc_get_topo_path(dev, reply.path, DC_PATH_MAX)) < 0) {
@@ -1359,13 +1371,13 @@ static zx_status_t dc_handle_device_read(device_t* dev) {
         }
         return ZX_OK;
     }
-    case dc_msg_t::Op::kLoadFirmware: {
+    case Message::Op::kLoadFirmware: {
         if (hcount != 0) {
             goto fail_wrong_hcount;
         }
         zx_handle_t vmo;
         struct {
-            dc_status_t rsp;
+            Status rsp;
             size_t size;
         } reply;
         if ((r = dc_load_firmware(dev, args, &vmo, &reply.size)) < 0) {
@@ -1378,19 +1390,19 @@ static zx_status_t dc_handle_device_read(device_t* dev) {
         }
         return ZX_OK;
     }
-    case dc_msg_t::Op::kStatus: {
+    case Message::Op::kStatus: {
         if (hcount != 0) {
             goto fail_wrong_hcount;
         }
         // all of these return directly and do not write a
         // reply, since this message is a reply itself
-        pending_t* pending = dev->pending.pop_front();
+        Pending* pending = dev->pending.pop_front();
         if (pending == nullptr) {
             log(ERROR, "devcoord: rpc: spurious status message\n");
             return ZX_OK;
         }
         switch (pending->op) {
-        case dc_pending::Op::kBind:
+        case Pending::Op::kBind:
             if (msg.status != ZX_OK) {
                 log(ERROR, "devcoord: rpc: bind-driver '%s' status %d\n",
                     dev->name, msg.status);
@@ -1399,12 +1411,12 @@ static zx_status_t dc_handle_device_read(device_t* dev) {
             }
             //TODO: try next driver, clear BOUND flag
             break;
-        case dc_pending::Op::kSuspend: {
+        case Pending::Op::kSuspend: {
             if (msg.status != ZX_OK) {
                 log(ERROR, "devcoord: rpc: suspend '%s' status %d\n",
                     dev->name, msg.status);
             }
-            auto ctx = static_cast<suspend_context_t*>(pending->ctx);
+            auto ctx = static_cast<SuspendContext*>(pending->ctx);
             ctx->status = msg.status;
             dc_continue_suspend(ctx);
             break;
@@ -1413,12 +1425,12 @@ static zx_status_t dc_handle_device_read(device_t* dev) {
         delete pending;
         return ZX_OK;
     }
-    case dc_msg_t::Op::kGetMetadata: {
+    case Message::Op::kGetMetadata: {
         if (hcount != 0) {
             goto fail_wrong_hcount;
         }
         struct {
-            dc_status_t rsp;
+            Status rsp;
             uint8_t data[DC_MAX_DATA];
         } reply;
         size_t actual = 0;
@@ -1428,14 +1440,14 @@ static zx_status_t dc_handle_device_read(device_t* dev) {
         uint32_t reply_size = static_cast<uint32_t>(sizeof(reply.rsp) + actual);
         return zx_channel_write(dev->hrpc, 0, &reply, reply_size, nullptr, 0);
     }
-    case dc_msg_t::Op::kAddMetadata: {
+    case Message::Op::kAddMetadata: {
         if (hcount != 0) {
             goto fail_wrong_hcount;
         }
         r = dc_add_metadata(dev, msg.value, data, msg.datalen);
         break;
     }
-    case dc_msg_t::Op::kPublishMetadata: {
+    case Message::Op::kPublishMetadata: {
         if (hcount != 0) {
             goto fail_wrong_hcount;
         }
@@ -1469,11 +1481,11 @@ fail_close_handles:
     goto done;
 }
 
-#define dev_from_ph(ph) containerof(ph, device_t, ph)
+#define dev_from_ph(ph) containerof(ph, Device, ph)
 
 // handle inbound RPCs from devhost to devices
 static zx_status_t dc_handle_device(port_handler_t* ph, zx_signals_t signals, uint32_t evt) {
-    device_t* dev = dev_from_ph(ph);
+    Device* dev = dev_from_ph(ph);
 
     if (signals & ZX_CHANNEL_READABLE) {
         zx_status_t r;
@@ -1497,9 +1509,9 @@ static zx_status_t dc_handle_device(port_handler_t* ph, zx_signals_t signals, ui
 }
 
 // send message to devhost, requesting the creation of a device
-static zx_status_t dh_create_device(device_t* dev, devhost_t* dh,
+static zx_status_t dh_create_device(Device* dev, Devhost* dh,
                                     const char* args, zx_handle_t rpc_proxy) {
-    dc_msg_t msg;
+    Message msg;
     uint32_t mlen;
     zx_status_t r;
 
@@ -1515,13 +1527,15 @@ static zx_status_t dh_create_device(device_t* dev, devhost_t* dh,
     hcount++;
 
     if (dev->libname[0]) {
-        if ((r = libname_to_vmo(dev->libname, handle + 1)) < 0) {
+        zx::vmo vmo;
+        if ((r = libname_to_vmo(dev->libname, &vmo)) < 0) {
             goto fail;
         }
+        handle[1] = vmo.release();
         hcount++;
-        msg.op = dc_msg_t::Op::kCreateDevice;
+        msg.op = Message::Op::kCreateDevice;
     } else {
-        msg.op = dc_msg_t::Op::kCreateDeviceStub;
+        msg.op = Message::Op::kCreateDeviceStub;
     }
 
     if (rpc_proxy) {
@@ -1554,7 +1568,7 @@ fail_after_write:
     return r;
 }
 
-static zx_status_t dc_create_proxy(device_t* parent) {
+static zx_status_t dc_create_proxy(Device* parent) {
     static constexpr const char kLibSuffix[] = ".so";
     static constexpr const char kProxyLibSuffix[] = ".proxy.so";
     static constexpr size_t kLibSuffixLen = sizeof(kLibSuffix) - 1;
@@ -1580,7 +1594,7 @@ static zx_status_t dc_create_proxy(device_t* parent) {
         liblen = liblen - kLibSuffixLen + kProxyLibSuffixLen;
     }
 
-    auto dev = fbl::make_unique<device_t>();
+    auto dev = fbl::make_unique<Device>();
     if (dev == nullptr) {
         return ZX_ERR_NO_MEMORY;
     }
@@ -1616,14 +1630,14 @@ static zx_status_t dc_create_proxy(device_t* parent) {
     return ZX_OK;
 }
 
-dc_pending::dc_pending() = default;
+Pending::Pending() = default;
 
 // send message to devhost, requesting the binding of a driver to a device
-static zx_status_t dh_bind_driver(device_t* dev, const char* libname) {
-    dc_msg_t msg;
+static zx_status_t dh_bind_driver(Device* dev, const char* libname) {
+    Message msg;
     uint32_t mlen;
 
-    auto pending = fbl::make_unique<pending_t>();
+    auto pending = fbl::make_unique<Pending>();
     if (pending == nullptr) {
         return ZX_ERR_NO_MEMORY;
     }
@@ -1633,27 +1647,28 @@ static zx_status_t dh_bind_driver(device_t* dev, const char* libname) {
         return r;
     }
 
-    zx_handle_t vmo;
+    zx::vmo vmo;
     if ((r = libname_to_vmo(libname, &vmo)) < 0) {
         return r;
     }
 
     msg.txid = 0;
-    msg.op = dc_msg_t::Op::kBindDriver;
+    msg.op = Message::Op::kBindDriver;
 
-    if ((r = zx_channel_write(dev->hrpc, 0, &msg, mlen, &vmo, 1)) < 0) {
+    zx_handle_t handles[] = { vmo.release() };
+    if ((r = zx_channel_write(dev->hrpc, 0, &msg, mlen, handles, fbl::count_of(handles))) < 0) {
         return r;
     }
 
     dev->flags |= DEV_CTX_BOUND;
-    pending->op = dc_pending::Op::kBind;
+    pending->op = Pending::Op::kBind;
     pending->ctx = nullptr;
     dev->pending.push_back(pending.release());
     return ZX_OK;
 }
 
-static zx_status_t dh_connect_proxy(const device_t* dev, zx_handle_t h) {
-    dc_msg_t msg;
+static zx_status_t dh_connect_proxy(const Device* dev, zx_handle_t h) {
+    Message msg;
     uint32_t mlen;
     zx_status_t r;
     if ((r = dc_msg_pack(&msg, &mlen, nullptr, 0, nullptr, nullptr)) < 0) {
@@ -1661,11 +1676,11 @@ static zx_status_t dh_connect_proxy(const device_t* dev, zx_handle_t h) {
         return r;
     }
     msg.txid = 0;
-    msg.op = dc_msg_t::Op::kConnectProxy;
+    msg.op = Message::Op::kConnectProxy;
     return zx_channel_write(dev->hrpc, 0, &msg, mlen, &h, 1);
 }
 
-static zx_status_t dc_prepare_proxy(device_t* dev) {
+static zx_status_t dc_prepare_proxy(Device* dev) {
     if (dev->flags & DEV_CTX_PROXY) {
         log(ERROR, "devcoord: cannot proxy a proxy: %s\n", dev->name);
         return ZX_ERR_INTERNAL;
@@ -1691,35 +1706,36 @@ static zx_status_t dc_prepare_proxy(device_t* dev) {
 
     // if this device has no devhost, first instantiate it
     if (dev->proxy->host == nullptr) {
-        zx_handle_t h0 = ZX_HANDLE_INVALID, h1 = ZX_HANDLE_INVALID;
+        zx::channel h0;
+        // May be either a VMO or a channel.
+        zx::handle h1;
 
         // the immortal root devices do not provide proxy rpc
         bool need_proxy_rpc = !(dev->flags & DEV_CTX_IMMORTAL);
 
         if (need_proxy_rpc) {
             // create rpc channel for proxy device to talk to the busdev it proxys
-            if ((r = zx_channel_create(0, &h0, &h1)) < 0) {
+            zx::channel c1;
+            if ((r = zx::channel::create(0, &h0, &c1)) < 0) {
                 log(ERROR, "devcoord: cannot create proxy rpc channel: %d\n", r);
                 return r;
             }
+            h1 = fbl::move(c1);
         } else if (dev == &sys_device) {
             // pass bootdata VMO handle to sys device
-            h1 = bootdata_vmo;
+            h1 = fbl::move(bootdata_vmo);
         }
         if ((r = dc_new_devhost(devhostname, dev->host,
                                 &dev->proxy->host)) < 0) {
             log(ERROR, "devcoord: dc_new_devhost: %d\n", r);
-            zx_handle_close(h0);
-            zx_handle_close(h1);
             return r;
         }
-        if ((r = dh_create_device(dev->proxy, dev->proxy->host, arg1, h1)) < 0) {
+        if ((r = dh_create_device(dev->proxy, dev->proxy->host, arg1, h1.release())) < 0) {
             log(ERROR, "devcoord: dh_create_device: %d\n", r);
-            zx_handle_close(h0);
             return r;
         }
         if (need_proxy_rpc) {
-            if ((r = dh_connect_proxy(dev, h0)) < 0) {
+            if ((r = dh_connect_proxy(dev, h0.release())) < 0) {
                 log(ERROR, "devcoord: dh_connect_proxy: %d\n", r);
             }
         }
@@ -1728,7 +1744,7 @@ static zx_status_t dc_prepare_proxy(device_t* dev) {
     return ZX_OK;
 }
 
-static zx_status_t dc_attempt_bind(const driver_t* drv, device_t* dev) {
+static zx_status_t dc_attempt_bind(const Driver* drv, Device* dev) {
     // cannot bind driver to already bound device
     if ((dev->flags & DEV_CTX_BOUND) && (!(dev->flags & DEV_CTX_MULTI_BIND))) {
         return ZX_ERR_BAD_STATE;
@@ -1755,7 +1771,7 @@ static zx_status_t dc_attempt_bind(const driver_t* drv, device_t* dev) {
     return r;
 }
 
-static void dc_handle_new_device(device_t* dev) {
+static void dc_handle_new_device(Device* dev) {
     for (auto& drv : list_drivers) {
         if (dc_is_bindable(&drv, dev->protocol_id,
                            dev->props.get(), dev->prop_count, true)) {
@@ -1783,11 +1799,11 @@ static void dc_suspend_fallback(uint32_t flags) {
     }
 }
 
-static zx_status_t dc_suspend_devhost(devhost_t* dh, suspend_context_t* ctx) {
+static zx_status_t dc_suspend_devhost(Devhost* dh, SuspendContext* ctx) {
     if (dh->devices.is_empty()) {
         return ZX_OK;
     }
-    device_t* dev = &dh->devices.front();
+    Device* dev = &dh->devices.front();
 
     if (!(dev->flags & DEV_CTX_PROXY)) {
         log(INFO, "devcoord: devhost root '%s' (%p) is not a proxy\n",
@@ -1798,29 +1814,26 @@ static zx_status_t dc_suspend_devhost(devhost_t* dh, suspend_context_t* ctx) {
     log(DEVLC, "devcoord: suspend devhost %p device '%s' (%p)\n",
         dh, dev->name, dev);
 
-    zx_handle_t rpc = ZX_HANDLE_INVALID;
-
-    auto pending = fbl::make_unique<pending_t>();
+    auto pending = fbl::make_unique<Pending>();
     if (pending == nullptr) {
         return ZX_ERR_NO_MEMORY;
     }
 
-    dc_msg_t msg;
+    Message msg;
     uint32_t mlen;
     zx_status_t r;
     if ((r = dc_msg_pack(&msg, &mlen, nullptr, 0, nullptr, nullptr)) < 0) {
         return r;
     }
     msg.txid = 0;
-    msg.op = dc_msg_t::Op::kSuspend;
+    msg.op = Message::Op::kSuspend;
     msg.value = ctx->sflags;
-    rpc = dev->hrpc;
-    if ((r = zx_channel_write(rpc, 0, &msg, mlen, nullptr, 0)) != ZX_OK) {
+    if ((r = zx_channel_write(dev->hrpc, 0, &msg, mlen, nullptr, 0)) != ZX_OK) {
         return r;
     }
 
     dh->flags |= DEV_HOST_SUSPEND;
-    pending->op = dc_pending::Op::kSuspend;
+    pending->op = Pending::Op::kSuspend;
     pending->ctx = ctx;
     dev->pending.push_back(pending.release());
 
@@ -1829,36 +1842,42 @@ static zx_status_t dc_suspend_devhost(devhost_t* dh, suspend_context_t* ctx) {
     return ZX_OK;
 }
 
-static void append_suspend_list(suspend_context_t* ctx, devhost_t* dh) {
+static void append_suspend_list(SuspendContext* ctx, Devhost* dh) {
     // suspend order is children first
     for (auto& child : dh->children) {
-        list_add_head(&ctx->devhosts, &child.snode);
+        ctx->devhosts.push_front(&child);
     }
     for (auto& child : dh->children) {
         append_suspend_list(ctx, &child);
     }
 }
 
-static void build_suspend_list(suspend_context_t* ctx) {
+// Returns the devhost at the front of the queue.
+static Devhost* build_suspend_list(SuspendContext* ctx) {
     // sys_device must suspend last as on x86 it invokes
     // ACPI S-state transition
-    list_add_head(&ctx->devhosts, &sys_device.proxy->host->snode);
+    ctx->devhosts.push_front(sys_device.proxy->host);
     append_suspend_list(ctx, sys_device.proxy->host);
-    list_add_head(&ctx->devhosts, &root_device.proxy->host->snode);
+
+    ctx->devhosts.push_front(root_device.proxy->host);
     append_suspend_list(ctx, root_device.proxy->host);
-    list_add_head(&ctx->devhosts, &misc_device.proxy->host->snode);
+
+    ctx->devhosts.push_front(misc_device.proxy->host);
     append_suspend_list(ctx, misc_device.proxy->host);
+
     // test devices do not (yet) participate in suspend
+
+    return &ctx->devhosts.front();
 }
 
-static void process_suspend_list(suspend_context_t* ctx) {
-    devhost_t* dh = ctx->dh;
-    devhost_t* parent = nullptr;
+static void process_suspend_list(SuspendContext* ctx) {
+    auto dh = ctx->devhosts.make_iterator(*ctx->dh);
+    Devhost* parent = nullptr;
     do {
         if (!parent || (dh->parent == parent)) {
-            // send dc_msg_t::Op::kSuspend each set of children of a devhost at a time,
+            // send Message::Op::kSuspend each set of children of a devhost at a time,
             // since they can run in parallel
-            dc_suspend_devhost(dh, &suspend_ctx);
+            dc_suspend_devhost(dh.CopyPointer(), &suspend_ctx);
             parent = dh->parent;
         } else {
             // if the parent is different than the previous devhost's
@@ -1868,14 +1887,18 @@ static void process_suspend_list(suspend_context_t* ctx) {
             parent = nullptr;
             break;
         }
-    } while ((dh = list_next_type(&ctx->devhosts, &dh->snode,
-                                  devhost_t, snode)) != nullptr);
+    } while (++dh != ctx->devhosts.end());
     // next devhost to process once all the outstanding suspends are done
-    ctx->dh = dh;
+    if (dh.IsValid()) {
+        ctx->dh = dh.CopyPointer();
+    } else {
+        ctx->dh = nullptr;
+        ctx->devhosts.clear();
+    }
 }
 
-static bool check_pending(const device_t* dev) {
-    const pending_t* pending = nullptr;
+static bool check_pending(const Device* dev) {
+    const Pending* pending = nullptr;
     if (dev->proxy) {
         if (!dev->proxy->pending.is_empty()) {
             pending = &dev->proxy->pending.back();
@@ -1885,7 +1908,7 @@ static bool check_pending(const device_t* dev) {
             pending = &dev->pending.back();
         }
     }
-    if ((pending == nullptr) || (pending->op != dc_pending::Op::kSuspend)) {
+    if ((pending == nullptr) || (pending->op != Pending::Op::kSuspend)) {
         return false;
     } else {
         log(ERROR, "  devhost with device '%s' timed out\n", dev->name);
@@ -1897,9 +1920,9 @@ static int suspend_timeout_thread(void* arg) {
     // 10 seconds
     zx_nanosleep(zx_deadline_after(ZX_SEC(10)));
 
-    auto ctx = static_cast<suspend_context_t*>(arg);
+    auto ctx = static_cast<SuspendContext*>(arg);
     if (suspend_debug) {
-        if (ctx->flags == suspend_context_t::Flags::kRunning) {
+        if (ctx->flags == SuspendContext::Flags::kRunning) {
             return 0; // success
         }
         log(ERROR, "devcoord: suspend time out\n");
@@ -1925,19 +1948,17 @@ static void dc_suspend(uint32_t flags) {
         return;
     }
 
-    suspend_context_t* ctx = &suspend_ctx;
-    if (ctx->flags == suspend_context_t::Flags::kSuspend) {
+    SuspendContext* ctx = &suspend_ctx;
+    if (ctx->flags == SuspendContext::Flags::kSuspend) {
         return;
     }
-    memset(ctx, 0, sizeof(*ctx));
+    *ctx = SuspendContext();
     ctx->status = ZX_OK;
-    ctx->flags = suspend_context_t::Flags::kSuspend;
+    ctx->flags = SuspendContext::Flags::kSuspend;
     ctx->sflags = flags;
-    ctx->socket = dmctl_socket;
-    dmctl_socket = ZX_HANDLE_INVALID;   // to prevent the rpc handler from closing this handle
-    list_initialize(&ctx->devhosts);
+    ctx->socket = fbl::move(dmctl_socket); // to prevent the rpc handler from closing this handle
 
-    build_suspend_list(ctx);
+    ctx->dh = build_suspend_list(ctx);
 
     if (suspend_fallback || suspend_debug) {
         thrd_t t;
@@ -1948,7 +1969,6 @@ static void dc_suspend(uint32_t flags) {
         }
     }
 
-    ctx->dh = list_peek_head_type(&ctx->devhosts, devhost_t, snode);
     process_suspend_list(ctx);
 }
 
@@ -1959,20 +1979,19 @@ static void dc_mexec(zx_handle_t* h) {
         return;
     }
 
-    suspend_context_t* ctx = &suspend_ctx;
-    if (ctx->flags == suspend_context_t::Flags::kSuspend) {
+    SuspendContext* ctx = &suspend_ctx;
+    if (ctx->flags == SuspendContext::Flags::kSuspend) {
         return;
     }
-    memset(ctx, 0, sizeof(*ctx));
+    *ctx = {};
     ctx->status = ZX_OK;
-    ctx->flags = suspend_context_t::Flags::kSuspend;
+    ctx->flags = SuspendContext::Flags::kSuspend;
     ctx->sflags = DEVICE_SUSPEND_FLAG_MEXEC;
-    list_initialize(&ctx->devhosts);
 
     ctx->kernel = *h;
     ctx->bootdata = *(h + 1);
 
-    build_suspend_list(ctx);
+    ctx->dh = build_suspend_list(ctx);
 
     if (suspend_fallback || suspend_debug) {
         thrd_t t;
@@ -1983,24 +2002,21 @@ static void dc_mexec(zx_handle_t* h) {
         }
     }
 
-    ctx->dh = list_peek_head_type(&ctx->devhosts, devhost_t, snode);
     process_suspend_list(ctx);
 }
 
-static void dc_continue_suspend(suspend_context_t* ctx) {
+static void dc_continue_suspend(SuspendContext* ctx) {
     if (ctx->status != ZX_OK) {
         // TODO: unroll suspend
         // do not continue to suspend as this indicates a driver suspend
         // problem and should show as a bug
         log(ERROR, "devcoord: failed to suspend\n");
         // notify dmctl
-        if (ctx->socket) {
-            zx_handle_close(ctx->socket);
-        }
+        ctx->socket.reset();
         if (ctx->sflags == DEVICE_SUSPEND_FLAG_MEXEC) {
             zx_object_signal(ctx->kernel, 0, ZX_USER_SIGNAL_0);
         }
-        ctx->flags = suspend_context_t::Flags::kRunning;
+        ctx->flags = SuspendContext::Flags::kRunning;
         return;
     }
 
@@ -2016,11 +2032,9 @@ static void dc_continue_suspend(suspend_context_t* ctx) {
             // suspend go to the kernel fallback
             dc_suspend_fallback(ctx->sflags);
             // this handle is leaked on the shutdown path for x86
-            if (ctx->socket) {
-                zx_handle_close(ctx->socket);
-            }
+            ctx->socket.reset();
             // if we get here the system did not suspend successfully
-            ctx->flags = suspend_context_t::Flags::kRunning;
+            ctx->flags = SuspendContext::Flags::kRunning;
         }
     }
 }
@@ -2030,7 +2044,7 @@ static void dc_continue_suspend(suspend_context_t* ctx) {
 static struct zx_bind_inst misc_device_binding =
     BI_MATCH_IF(EQ, BIND_PROTOCOL, ZX_PROTOCOL_MISC_PARENT);
 
-static bool is_misc_driver(driver_t* drv) {
+static bool is_misc_driver(Driver* drv) {
     return (drv->binding_size == sizeof(misc_device_binding)) &&
         (memcmp(&misc_device_binding, drv->binding.get(), sizeof(misc_device_binding)) == 0);
 }
@@ -2040,7 +2054,7 @@ static bool is_misc_driver(driver_t* drv) {
 static struct zx_bind_inst test_device_binding =
     BI_MATCH_IF(EQ, BIND_PROTOCOL, ZX_PROTOCOL_TEST_PARENT);
 
-static bool is_test_driver(driver_t* drv) {
+static bool is_test_driver(Driver* drv) {
     return (drv->binding_size == sizeof(test_device_binding)) &&
         (memcmp(&test_device_binding, drv->binding.get(), sizeof(test_device_binding)) == 0);
 }
@@ -2051,7 +2065,7 @@ static bool is_test_driver(driver_t* drv) {
 static struct zx_bind_inst root_device_binding =
     BI_MATCH_IF(EQ, BIND_PROTOCOL, ZX_PROTOCOL_ROOT);
 
-static bool is_root_driver(driver_t* drv) {
+static bool is_root_driver(Driver* drv) {
     return (drv->binding_size == sizeof(root_device_binding)) &&
         (memcmp(&root_device_binding, drv->binding.get(), sizeof(root_device_binding)) == 0);
 }
@@ -2061,7 +2075,7 @@ static bool is_root_driver(driver_t* drv) {
 // drivers are added directly to the all-drivers or fallback list.
 //
 // TODO: fancier priorities
-static void dc_driver_added_init(driver_t* drv, const char* version) {
+static void dc_driver_added_init(Driver* drv, const char* version) {
     if (version[0] == '*') {
         // fallback driver, load only if all else fails
         list_drivers_fallback.push_back(drv);
@@ -2074,34 +2088,34 @@ static void dc_driver_added_init(driver_t* drv, const char* version) {
     }
 }
 
-static work_t new_driver_work;
+static Work new_driver_work;
 
 // dc_driver_added is called when a driver is added after the
 // devcoordinator has started.  The driver is added to the new-drivers
 // list and work is queued to process it.
-static void dc_driver_added(driver_t* drv, const char* version) {
+static void dc_driver_added(Driver* drv, const char* version) {
     list_drivers_new.push_back(drv);
-    if (new_driver_work.op == dc_work::Op::kIdle) {
-        queue_work(&new_driver_work, dc_work::Op::kDriverAdded, 0);
+    if (new_driver_work.op == Work::Op::kIdle) {
+        queue_work(&new_driver_work, Work::Op::kDriverAdded, 0);
     }
 }
 
-device_t* coordinator_init(zx_handle_t root_job) {
+Device* coordinator_init(const zx::job& root_job) {
     printf("coordinator_init()\n");
 
-    zx_status_t status = zx_job_create(root_job, 0u, &devhost_job);
+    zx_status_t status = zx::job::create(root_job, 0u, &devhost_job);
     if (status < 0) {
         log(ERROR, "devcoord: unable to create devhost job\n");
     }
     static const zx_policy_basic_t policy[] = {
         { ZX_POL_BAD_HANDLE, ZX_POL_ACTION_EXCEPTION },
     };
-    status = zx_job_set_policy(devhost_job, ZX_JOB_POL_RELATIVE,
-                               ZX_JOB_POL_BASIC, &policy, fbl::count_of(policy));
+    status = devhost_job.set_policy(ZX_JOB_POL_RELATIVE,
+                                    ZX_JOB_POL_BASIC, &policy, fbl::count_of(policy));
     if (status < 0) {
         log(ERROR, "devcoord: zx_job_set_policy() failed\n");
     }
-    zx_object_set_property(devhost_job, ZX_PROP_NAME, "zircon-drivers", 15);
+    devhost_job.set_property(ZX_PROP_NAME, "zircon-drivers", 15);
 
     port_init(&dc_port);
 
@@ -2111,7 +2125,7 @@ device_t* coordinator_init(zx_handle_t root_job) {
 // dc_bind_driver is called when a new driver becomes available to
 // the devcoordinator.  Existing devices are inspected to see if the
 // new driver is bindable to them (unless they are already bound).
-void dc_bind_driver(driver_t* drv) {
+void dc_bind_driver(Driver* drv) {
     if (dc_running) {
         printf("devcoord: driver '%s' added\n", drv->name.c_str());
     }
@@ -2140,7 +2154,7 @@ void dc_bind_driver(driver_t* drv) {
 }
 
 void dc_handle_new_driver() {
-    driver_t* drv;
+    Driver* drv;
     while ((drv = list_drivers_new.pop_front()) != nullptr) {
         list_drivers.push_back(drv);
         dc_bind_driver(drv);
@@ -2154,7 +2168,7 @@ static bool system_available;
 static bool system_loaded;
 
 // List of drivers loaded from /system by system_driver_loader()
-static fbl::DoublyLinkedList<driver_t*, driver_t::Node> list_drivers_system;
+static fbl::DoublyLinkedList<Driver*, Driver::Node> list_drivers_system;
 
 static int system_driver_loader(void* arg);
 
@@ -2171,7 +2185,7 @@ static zx_status_t dc_control_event(port_handler_t* ph, zx_signals_t signals, ui
         }
         break;
     case CTL_ADD_SYSTEM: {
-        driver_t* drv;
+        Driver* drv;
         // Add system drivers to the new list
         while ((drv = list_drivers_system.pop_front()) != nullptr) {
             list_drivers_new.push_back(drv);
@@ -2182,8 +2196,8 @@ static zx_status_t dc_control_event(port_handler_t* ph, zx_signals_t signals, ui
             list_drivers_new.push_back(drv);
         }
         // Queue Driver Added work if not already queued
-        if (new_driver_work.op == dc_work::Op::kIdle) {
-            queue_work(&new_driver_work, dc_work::Op::kDriverAdded, 0);
+        if (new_driver_work.op == Work::Op::kIdle) {
+            queue_work(&new_driver_work, Work::Op::kDriverAdded, 0);
         }
         break;
     }
@@ -2202,7 +2216,7 @@ static port_handler_t control_handler = []() {
 // CTL_ADD_SYSTEM is sent.
 //
 // TODO: fancier priority management
-static void dc_driver_added_sys(driver_t* drv, const char* version) {
+static void dc_driver_added_sys(Driver* drv, const char* version) {
     log(INFO, "devmgr: adding system driver '%s' '%s'\n", drv->name.c_str(), drv->libname.c_str());
 
     if (load_vmo(drv->libname.c_str(), &drv->dso_vmo)) {
@@ -2277,7 +2291,7 @@ void coordinator() {
     if (require_system && !system_loaded) {
         printf("devcoord: full system required, ignoring fallback drivers until /system is loaded\n");
     } else {
-        driver_t* drv;
+        Driver* drv;
         while ((drv = list_drivers_fallback.pop_back()) != nullptr) {
             list_drivers.push_back(drv);
         }

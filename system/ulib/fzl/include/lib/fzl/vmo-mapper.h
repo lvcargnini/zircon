@@ -20,19 +20,12 @@ public:
 
     // Move support
     VmoMapper(VmoMapper&& other) {
-        *this = fbl::move(other);
+        MoveFromOther(&other);
     }
 
     VmoMapper& operator=(VmoMapper&& other) {
         Unmap();
-        vmar_manager_ = fbl::move(other.vmar_manager_);
-
-        start_ = other.start_;
-        other.start_ = nullptr;
-
-        size_ = other.size_;
-        other.size_ = 0;
-
+        MoveFromOther(&other);
         return *this;
     }
 
@@ -53,7 +46,7 @@ public:
     // cache_policy : When non-zero, indicates the cache policy to apply to the
     //                created VMO.
     zx_status_t CreateAndMap(uint64_t size,
-                             uint32_t map_flags,
+                             zx_vm_option_t map_flags,
                              fbl::RefPtr<VmarManager> vmar_manager = nullptr,
                              zx::vmo* vmo_out = nullptr,
                              zx_rights_t vmo_rights = ZX_RIGHT_SAME_RIGHTS,
@@ -72,32 +65,37 @@ public:
     zx_status_t Map(const zx::vmo& vmo,
                     uint64_t offset,
                     uint64_t size,
-                    uint32_t map_flags,
+                    zx_vm_option_t map_flags,
                     fbl::RefPtr<VmarManager> vmar_manager = nullptr);
 
     // Unmap the VMO from whichever VMAR it was mapped into.
     void Unmap();
 
-    void* start() const { return start_; }
+    void* start() const { return reinterpret_cast<void*>(start_); }
     uint64_t size() const { return size_; }
+    const fbl::RefPtr<VmarManager>& manager() const { return vmar_manager_; }
 
-private:
+protected:
     zx_status_t CheckReadyToMap(const fbl::RefPtr<VmarManager>& vmar_manager);
     zx_status_t InternalMap(const zx::vmo& vmo,
                             uint64_t offset,
                             uint64_t size,
-                            uint32_t map_flags,
+                            zx_vm_option_t map_flags,
                             fbl::RefPtr<VmarManager> vmar_manager);
 
-    fbl::RefPtr<VmarManager> vmar_manager_;
-    void* start_ = nullptr;
-    uint64_t size_ = 0;
-};
+    void MoveFromOther(VmoMapper* other) {
+        vmar_manager_ = fbl::move(other->vmar_manager_);
 
-class RefCountedVmoMapper : public VmoMapper,
-                            public fbl::RefCounted<VmoMapper> {
-public:
-    RefCountedVmoMapper() = default;
+        start_ = other->start_;
+        other->start_ = 0;
+
+        size_ = other->size_;
+        other->size_ = 0;
+    }
+
+    fbl::RefPtr<VmarManager> vmar_manager_;
+    uintptr_t start_ = 0;
+    uint64_t size_ = 0;
 };
 
 }  // namespace fzl

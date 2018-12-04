@@ -45,6 +45,26 @@ constexpr pbus_mmio_t mipi_mmios[] = {
         .base = T931_MIPI_ADAPTER_BASE,
         .length = T931_MIPI_ADAPTER_LENGTH,
     },
+    // HIU for clocks.
+    {
+        .base = T931_HIU_BASE,
+        .length = T931_HIU_LENGTH,
+    },
+    // Power domain
+    {
+        .base = T931_POWER_DOMAIN_BASE,
+        .length = T931_POWER_DOMAIN_LENGTH,
+    },
+    // Memory PD
+    {
+        .base = T931_MEMORY_PD_BASE,
+        .length = T931_MEMORY_PD_LENGTH,
+    },
+    // Reset
+    {
+        .base = T931_RESET_BASE,
+        .length = T931_RESET_LENGTH,
+    },
 };
 
 constexpr camera_sensor_t mipi_sensor[] = {
@@ -54,6 +74,19 @@ constexpr camera_sensor_t mipi_sensor[] = {
         .did = PDEV_DID_CAMERA_SENSOR,
     },
 };
+
+constexpr pbus_bti_t mipi_btis[] = {
+    {
+        .iommu_index = 0,
+        .bti_id = BTI_CAMERA,
+    },
+};
+
+constexpr pbus_irq_t mipi_irqs[] = {
+    {
+        .irq = T931_MIPI_ADAPTER_IRQ,
+        .mode = ZX_INTERRUPT_MODE_EDGE_HIGH,
+    }};
 
 constexpr pbus_metadata_t mipi_metadata[] = {
     {
@@ -116,6 +149,10 @@ static pbus_dev_t mipi_dev = []() {
     dev.metadata_count = countof(mipi_metadata);
     dev.child_list = &mipi_children;
     dev.child_count = 1;
+    dev.bti_list = mipi_btis;
+    dev.bti_count = countof(mipi_btis);
+    dev.irq_list = mipi_irqs;
+    dev.irq_count = countof(mipi_irqs);
     return dev;
 }();
 
@@ -129,7 +166,6 @@ zx_status_t Sherlock::CameraInit() {
 
     gpio_impl.SetAltFunction(T931_GPIOA(14), kI2cSDAAltFunc);
     gpio_impl.SetAltFunction(T931_GPIOA(15), kI2cSCLAltFunc);
-
 
     zx_status_t status = pbus_.DeviceAdd(&mipi_dev);
     if (status != ZX_OK) {

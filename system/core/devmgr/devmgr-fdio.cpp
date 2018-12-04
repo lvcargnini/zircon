@@ -10,6 +10,8 @@
 #include <fbl/algorithm.h>
 #include <lib/fdio/io.h>
 #include <lib/fdio/util.h>
+#include <lib/zx/debuglog.h>
+#include <lib/zx/resource.h>
 #include <lib/zx/vmo.h>
 
 #include <zircon/paths.h>
@@ -27,12 +29,12 @@ namespace devmgr {
 
 void devmgr_io_init() {
     // setup stdout
-    zx_handle_t h;
-    if (zx_debuglog_create(ZX_HANDLE_INVALID, 0, &h) < 0) {
+    zx::debuglog h;
+    if (zx::debuglog::create(zx::resource(), 0, &h) < 0) {
         return;
     }
     fdio_t* logger;
-    if ((logger = fdio_logger_create(h)) == nullptr) {
+    if ((logger = fdio_logger_create(h.release())) == nullptr) {
         return;
     }
     close(1);
@@ -65,12 +67,12 @@ void devmgr_disable_appmgr_services() {
 }
 
 zx_status_t devmgr_launch(
-    zx_handle_t job, const char* name,
+    const zx::job& job, const char* name,
     zx_status_t (*load)(void*, launchpad_t*, const char*), void* ctx,
     int argc, const char* const* argv,
     const char** _envp, int stdiofd,
     const zx_handle_t* handles, const uint32_t* types, size_t hcount,
-    zx_handle_t* proc, uint32_t flags) {
+    zx::process* out_proc, uint32_t flags) {
     zx_status_t status;
     const char* envp[MAX_ENVP + 1];
     unsigned envn = 0;
@@ -84,11 +86,11 @@ zx_status_t devmgr_launch(
     }
     envp[envn++] = nullptr;
 
-    zx_handle_t job_copy = ZX_HANDLE_INVALID;
-    zx_handle_duplicate(job, CHILD_JOB_RIGHTS, &job_copy);
+    zx::job job_copy;
+    job.duplicate(CHILD_JOB_RIGHTS, &job_copy);
 
     launchpad_t* lp;
-    launchpad_create(job_copy, name, &lp);
+    launchpad_create(job_copy.get(), name, &lp);
 
     status = (*load)(ctx, lp, argv[0]);
     if (status != ZX_OK) {
@@ -125,23 +127,26 @@ zx_status_t devmgr_launch(
 
     launchpad_add_handles(lp, hcount, handles, types);
 
+    zx::process proc;
     const char* errmsg;
-    if ((status = launchpad_go(lp, proc, &errmsg)) < 0) {
+    if ((status = launchpad_go(lp, proc.reset_and_get_address(), &errmsg)) < 0) {
         printf("devmgr: launchpad %s (%s) failed: %s: %d\n",
                argv[0], name, errmsg, status);
     } else {
+        if (out_proc != nullptr) {
+            *out_proc = fbl::move(proc);
+        }
         printf("devmgr: launch %s (%s) OK\n", argv[0], name);
     }
-    zx_handle_close(job_copy);
     return status;
 }
 
 zx_status_t devmgr_launch_cmdline(
-    const char* me, zx_handle_t job, const char* name,
+    const char* me, const zx::job& job, const char* name,
     zx_status_t (*load)(void* ctx, launchpad_t*, const char* file), void* ctx,
     const char* cmdline,
     const zx_handle_t* handles, const uint32_t* types, size_t hcount,
-    zx_handle_t* proc, uint32_t flags) {
+    zx::process* proc, uint32_t flags) {
 
     // Get the full commandline by splitting on '+'.
     char* buf = strdup(cmdline);

@@ -18,12 +18,13 @@
 
 #include <ddktl/device.h>
 #include <ddktl/protocol/block.h>
-#include <lib/fzl/mapped-vmo.h>
 #include <fbl/algorithm.h>
 #include <fbl/intrusive_wavl_tree.h>
 #include <fbl/mutex.h>
 #include <fbl/unique_ptr.h>
 #include <fbl/vector.h>
+#include <lib/fzl/owned-vmo-mapper.h>
+#include <lib/zx/vmo.h>
 
 namespace fvm {
 
@@ -95,7 +96,9 @@ public:
 
     // Block Protocol
     size_t BlockOpSize() const { return block_op_size_; }
-    void Queue(block_op_t* txn) const { bp_.ops->queue(bp_.ctx, txn); }
+    void Queue(block_op_t* txn, block_impl_queue_callback completion_cb, void* cookie) const {
+        bp_.ops->queue(bp_.ctx, txn, completion_cb, cookie);
+    }
 
     // Acquire access to a VPart Entry which has already been modified (and
     // will, as a consequence, not be de-allocated underneath us).
@@ -127,7 +130,7 @@ public:
     void DdkRelease();
 
     VPartitionManager(zx_device_t* dev, const block_info_t& info, size_t block_op_size,
-                      const block_protocol_t* bp);
+                      const block_impl_protocol_t* bp);
     ~VPartitionManager();
 
 private:
@@ -159,7 +162,7 @@ private:
     zx_status_t FindFreeSliceLocked(size_t* out, size_t hint) const TA_REQ(lock_);
 
     fvm_t* GetFvmLocked() const TA_REQ(lock_) {
-        return reinterpret_cast<fvm_t*>(metadata_->GetData());
+        return reinterpret_cast<fvm_t*>(metadata_.start());
     }
 
     // Mark a slice as free in the metadata structure.
@@ -196,7 +199,7 @@ private:
     block_info_t info_; // Cached info from parent device
 
     fbl::Mutex lock_;
-    fbl::unique_ptr<fzl::MappedVmo> metadata_ TA_GUARDED(lock_);
+    fzl::OwnedVmoMapper metadata_ TA_GUARDED(lock_);
     bool first_metadata_is_primary_ TA_GUARDED(lock_);
     size_t metadata_size_;
     size_t slice_size_;
@@ -207,10 +210,10 @@ private:
 
     // Block Protocol
     const size_t block_op_size_;
-    block_protocol_t bp_;
+    block_impl_protocol_t bp_;
 };
 
-class VPartition : public PartitionDeviceType, public ddk::BlockProtocol<VPartition> {
+class VPartition : public PartitionDeviceType, public ddk::BlockImplProtocol<VPartition> {
 public:
     static zx_status_t Create(VPartitionManager* vpm, size_t entry_index,
                               fbl::unique_ptr<VPartition>* out);
@@ -222,8 +225,12 @@ public:
     void DdkRelease();
 
     // Block Protocol
-    void BlockQuery(block_info_t* info_out, size_t* block_op_size_out);
-    void BlockQueue(block_op_t* txn);
+    void BlockImplQuery(block_info_t* info_out, size_t* block_op_size_out);
+    void BlockImplQueue(block_op_t* txn, block_impl_queue_callback completion_cb, void* cookie);
+    zx_status_t BlockImplGetStats(const void* cmd_buffer, size_t cmd_size, void* out_reply_buffer,
+                                  size_t reply_size, size_t* out_reply_actual) {
+        return ZX_ERR_NOT_SUPPORTED;
+    }
 
     auto ExtentBegin() TA_REQ(lock_) {
         return slice_map_.begin();

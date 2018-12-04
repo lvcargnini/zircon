@@ -18,11 +18,20 @@
 #define T931_I2C2_BASE                  (T931_CBUS_BASE + 0x1d000)
 #define T931_I2C3_BASE                  (T931_CBUS_BASE + 0x1c000)
 
-#define T931_RESET_BASE                 0xffd01000
-#define T931_RESET_LENGTH               0x1000
+#define T931_DOS_BASE                   0xff620000
+#define T931_DOS_LENGTH                 0x10000
+
+#define T931_DMC_BASE                   0xff638000
+#define T931_DMC_LENGTH                 0x1000
 
 #define T931_HIU_BASE                   0xff63c000
 #define T931_HIU_LENGTH                 0x2000
+
+#define T931_AOBUS_BASE                 0xff800000
+#define T931_AOBUS_LENGTH               0x100000
+
+#define T931_CBUS_BASE                  0xffd00000
+#define T931_CBUS_LENGTH                0x100000
 
 #define T931_MSR_CLK_BASE               0xffd18000
 #define T931_MSR_CLK_LENGTH             0x1000
@@ -40,6 +49,19 @@
 #define T931_MIPI_ADAPTER_BASE          0xff650000
 #define T931_MIPI_ADAPTER_LENGTH        0x6000
 
+// Power domain
+#define T931_POWER_DOMAIN_BASE          0xff800000
+#define T931_POWER_DOMAIN_LENGTH        0x1000
+
+// Memory Power Domain
+#define T931_MEMORY_PD_BASE             0xff63c000
+#define T931_MEMORY_PD_LENGTH           0x1000
+
+// Reset
+#define T931_RESET_BASE                 0xffd01000
+#define T931_RESET_LENGTH               0x100
+
+// USB.
 #define T931_USB0_BASE                  0xff500000
 #define T931_USB0_LENGTH                0x100000
 
@@ -73,6 +95,11 @@
 #define T931_RESET7_LEVEL             0x9c
 
 // IRQs
+#define T931_DEMUX_IRQ                  55
+#define T931_PARSER_IRQ                 64
+#define T931_DOS_MBOX_0_IRQ             75
+#define T931_DOS_MBOX_1_IRQ             76
+#define T931_DOS_MBOX_2_IRQ             77
 #define T931_GPIO_IRQ_0                 96
 #define T931_GPIO_IRQ_1                 97
 #define T931_GPIO_IRQ_2                 98
@@ -91,6 +118,7 @@
 #define T931_MALI_IRQ_GP                192
 #define T931_MALI_IRQ_GPMMU             193
 #define T931_MALI_IRQ_PP                194
+#define T931_MIPI_ADAPTER_IRQ           211
 
 // Alternate Functions for EMMC
 #define T931_EMMC_D0                    T931_GPIOBOOT(0)

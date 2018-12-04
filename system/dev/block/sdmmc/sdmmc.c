@@ -18,6 +18,7 @@
 #include <ddk/debug.h>
 #include <ddk/protocol/platform-device.h>
 #include <ddk/protocol/sdmmc.h>
+#include <ddk/trace/event.h>
 
 // Zircon Includes
 #include <lib/sync/completion.h>
@@ -27,11 +28,6 @@
 #include <zircon/syscalls.h>
 #include <zircon/threads.h>
 #include <zircon/device/block.h>
-
-// Tracing Includes
-#include <lib/async-loop/loop.h>
-#include <trace-provider/provider.h>
-#include <trace/event.h>
 
 #include "sdmmc.h"
 
@@ -44,77 +40,26 @@
 
 #define BLOCK_OP(op)    ((op) & BLOCK_OP_MASK)
 
-#if WITH_STATS
-#define STAT_INC(name) do { dev->stat_##name++; } while (0)
-#define STAT_DEC(name) do { dev->stat_##name--; } while (0)
-#define STAT_DEC_IF(name, c) do { if (c) dev->stat_##name--; } while (0)
-#define STAT_ADD(name, num) do { dev->stat_##name += num; } while (0)
-#define STAT_INC_MAX(name) do { \
-    if (++dev->stat_##name > dev->stat_max_##name) { \
-        dev->stat_max_##name = dev->stat_##name; \
-    }} while (0)
-#else
-#define STAT_INC(name) do { } while (0)
-#define STAT_DEC(name) do { } while (0)
-#define STAT_DEC_IF(name, c) do { } while (0)
-#define STAT_ADD(name, num) do { } while (0)
-#define STAT_INC_MAX(name) do { } while (0)
-#endif
+// block io transactions. one per client request
+typedef struct sdmmc_txn {
+    block_op_t bop;
+    list_node_t node;
+    block_impl_queue_callback completion_cb;
+    void* cookie;
+} sdmmc_txn_t;
 
-static void register_trace(sdmmc_device_t* dev) {
-    dev->trace_on = true;
-    // Create a message loop.
-    zx_status_t status = async_loop_create(&kAsyncLoopConfigNoAttachToThread, &(dev->loop));
-    if (status != ZX_OK) {
-        zxlogf(ERROR, "Failed to create a message loop.\n");
-        zxlogf(ERROR, "Failed to register the tracing interface.\n");
-        dev->trace_on = false;
-        return;
-    }
-
-    // Start a thread for the loop to run on.
-    // We could instead use async_loop_run() to run on the current thread.
-    status = async_loop_start_thread(dev->loop, "loop", NULL);
-    if (status != ZX_OK) {
-        zxlogf(ERROR, "Failed to start a thread.\n");
-        zxlogf(ERROR, "Failed to register the tracing interface.\n");
-        dev->trace_on = false;
-        return;
-    }
-
-    // Create the trace provider.
-    async_dispatcher_t* async = async_loop_get_dispatcher(dev->loop);
-    dev->trace_provider = trace_provider_create(async);
-    if (!dev->trace_provider) {
-        zxlogf(ERROR, "Failed to create a trace provider.\n");
-        zxlogf(ERROR, "Failed to register the tracing interface.\n");
-        dev->trace_on = false;
-        return;
-    }
-    zxlogf(TRACE, "Tracing interface is registered successfully!\n");
-}
-
-static void close_trace(void* ctx) {
-    sdmmc_device_t* dev = ctx;
-    trace_provider_destroy(dev->trace_provider);
-    async_loop_shutdown(dev->loop);
-    dev->trace_on = false;
-    zxlogf(TRACE, "Tracing interface is closed successfully!\n");
-}
-
-static void block_complete(block_op_t* bop, zx_status_t status, sdmmc_device_t* dev) {
-    if (bop->completion_cb) {
-        if (dev->trace_on) {
-            TRACE_ASYNC_END("sdmmc","sdmmc_do_txn", dev->async_id,
+static void block_complete(sdmmc_txn_t* txn, zx_status_t status, sdmmc_device_t* dev) {
+    const block_op_t* bop = &txn->bop;
+    if (txn->completion_cb) {
+        // If tracing is not enabled this is a no-op.
+        TRACE_ASYNC_END("sdmmc","sdmmc_do_txn", dev->async_id,
             "command", TA_INT32(bop->rw.command),
             "extra", TA_INT32(bop->rw.extra),
             "length", TA_INT32(bop->rw.length),
             "offset_vmo", TA_INT64(bop->rw.offset_vmo),
             "offset_dev", TA_INT64(bop->rw.offset_dev),
-            "pages", TA_POINTER(bop->rw.pages),
             "txn_status", TA_INT32(status));
-        }
-        bop->completion_cb(bop, status);
+        txn->completion_cb(txn->cookie, status, &txn->bop);
     } else {
         zxlogf(TRACE, "sdmmc: block op %p completion_cb unset!\n", bop);
     }
@@ -138,34 +83,6 @@ static zx_status_t sdmmc_ioctl(void* ctx, uint32_t op, const void* cmd,
         *out_actual = sizeof(*info);
         return ZX_OK;
     }
-    case IOCTL_BLOCK_GET_STATS: {
-#if WITH_STATS
-        if (cmdlen != sizeof(bool)) {
-            return ZX_ERR_INVALID_ARGS;
-        }
-        block_stats_t* out = reply;
-        if (max < sizeof(*out)) {
-            return ZX_ERR_BUFFER_TOO_SMALL;
-        }
-        SDMMC_LOCK(dev);
-        out->max_concur = dev->stat_max_concur;
-        out->max_pending = dev->stat_max_pending;
-        out->total_ops = dev->stat_total_ops;
-        out->total_blocks = dev->stat_total_blocks;
-        bool clear = *(bool *)cmd;
-        if (clear) {
-            dev->stat_max_concur = 0;
-            dev->stat_max_pending = 0;
-            dev->stat_total_ops = 0;
-            dev->stat_total_blocks = 0;
-        }
-        SDMMC_UNLOCK(dev);
-        *out_actual = sizeof(*out);
-        return ZX_OK;
-#else
-        return ZX_ERR_NOT_SUPPORTED;
-#endif
-    }
     case IOCTL_DEVICE_SYNC:
         return ZX_OK;
     default:
@@ -177,7 +94,6 @@ static zx_status_t sdmmc_ioctl(void* ctx, uint32_t op, const void* cmd,
 static void sdmmc_unbind(void* ctx) {
     sdmmc_device_t* dev = ctx;
     device_remove(dev->zxdev);
-    close_trace(ctx);
 }
 
 static void sdmmc_release(void* ctx) {
@@ -194,7 +110,7 @@ static void sdmmc_release(void* ctx) {
         list_for_every_entry(&dev->txn_list, txn, sdmmc_txn_t, node) {
             SDMMC_UNLOCK(dev);
 
-            block_complete(&txn->bop, ZX_ERR_BAD_STATE, dev);
+            block_complete(txn, ZX_ERR_BAD_STATE, dev);
 
             SDMMC_LOCK(dev);
         }
@@ -226,20 +142,23 @@ static void sdmmc_query(void* ctx, block_info_t* info_out, size_t* block_op_size
     *block_op_size_out = sizeof(sdmmc_txn_t);
 }
 
-static void sdmmc_queue(void* ctx, block_op_t* btxn) {
+static void sdmmc_queue(void* ctx, block_op_t* btxn, block_impl_queue_callback completion_cb,
+                        void* cookie) {
     sdmmc_device_t* dev = ctx;
     sdmmc_txn_t* txn = containerof(btxn, sdmmc_txn_t, bop);
+    txn->completion_cb = completion_cb;
+    txn->cookie = cookie;
 
     switch (BLOCK_OP(btxn->command)) {
     case BLOCK_OP_READ:
     case BLOCK_OP_WRITE: {
         uint64_t max = dev->block_info.block_count;
         if ((btxn->rw.offset_dev >= max) || ((max - btxn->rw.offset_dev) < btxn->rw.length)) {
-            block_complete(btxn, ZX_ERR_OUT_OF_RANGE, dev);
+            block_complete(txn, ZX_ERR_OUT_OF_RANGE, dev);
             return;
         }
         if (btxn->rw.length == 0) {
-            block_complete(btxn, ZX_OK, dev);
+            block_complete(txn, ZX_OK, dev);
             return;
         }
         break;
@@ -249,20 +168,13 @@ static void sdmmc_queue(void* ctx, block_op_t* btxn) {
         // driver, when this op gets processed all previous ops are complete.
         break;
     default:
-        block_complete(btxn, ZX_ERR_NOT_SUPPORTED, dev);
+        block_complete(txn, ZX_ERR_NOT_SUPPORTED, dev);
         return;
     }
 
     SDMMC_LOCK(dev);
 
-    STAT_INC(total_ops);
-    if ((BLOCK_OP(btxn->command) == BLOCK_OP_READ) ||
-        (BLOCK_OP(btxn->command) == BLOCK_OP_WRITE)) {
-        STAT_ADD(total_blocks, btxn->rw.length);
-    }
-
     list_add_tail(&dev->txn_list, &txn->node);
-    STAT_INC_MAX(pending);
     // Wake up the worker thread (while locked, so they don't accidentally
     // clear the event).
     zx_object_signal(dev->worker_event, 0, SDMMC_TXN_RECEIVED);
@@ -271,7 +183,7 @@ static void sdmmc_queue(void* ctx, block_op_t* btxn) {
 }
 
 // Block protocol
-static block_protocol_ops_t block_proto = {
+static block_impl_protocol_ops_t block_proto = {
     .query = sdmmc_query,
     .queue = sdmmc_queue,
 };
@@ -321,15 +233,16 @@ static zx_status_t sdmmc_wait_for_tran(sdmmc_device_t* dev) {
 }
 
 static void sdmmc_do_txn(sdmmc_device_t* dev, sdmmc_txn_t* txn) {
-    if (dev->trace_on) {
+    // The TRACE_*() event macros are empty if driver tracing isn't enabled.
+    // But that doesn't work for our call to trace_state().
+    if (TRACE_ENABLED()) {
         dev->async_id = TRACE_NONCE();
         TRACE_ASYNC_BEGIN("sdmmc","sdmmc_do_txn", dev->async_id,
             "command", TA_INT32(txn->bop.rw.command),
             "extra", TA_INT32(txn->bop.rw.extra),
             "length", TA_INT32(txn->bop.rw.length),
             "offset_vmo", TA_INT64(txn->bop.rw.offset_vmo),
-            "offset_dev", TA_INT64(txn->bop.rw.offset_dev),
-            "pages", TA_POINTER(txn->bop.rw.pages));
+            "offset_dev", TA_INT64(txn->bop.rw.offset_dev));
     }
 
     uint32_t cmd_idx = 0;
@@ -356,13 +269,13 @@ static void sdmmc_do_txn(sdmmc_device_t* dev, sdmmc_txn_t* txn) {
         }
         break;
     case BLOCK_OP_FLUSH:
-        block_complete(&txn->bop, ZX_OK, dev);
+        block_complete(txn, ZX_OK, dev);
         return;
     default:
         // should not get here
         zxlogf(ERROR, "sdmmc: do_txn invalid block op %d\n", BLOCK_OP(txn->bop.command));
         ZX_DEBUG_ASSERT(true);
-        block_complete(&txn->bop, ZX_ERR_INVALID_ARGS, dev);
+        block_complete(txn, ZX_ERR_INVALID_ARGS, dev);
         return;
     }
 
@@ -397,7 +310,7 @@ static void sdmmc_do_txn(sdmmc_device_t* dev, sdmmc_txn_t* txn) {
                          (uintptr_t*)&req->virt_buffer);
         if (st != ZX_OK) {
             zxlogf(TRACE, "sdmmc: do_txn vmo map error %d\n", st);
-            block_complete(&txn->bop, st, dev);
+            block_complete(txn, st, dev);
             return;
         }
         req->virt_size = txn->bop.rw.length;
@@ -421,7 +334,7 @@ exit:
     if (!req->use_dma) {
         zx_vmar_unmap(zx_vmar_root_self(), (uintptr_t)req->virt_buffer, req->virt_size);
     }
-    block_complete(&txn->bop, st, dev);
+    block_complete(txn, st, dev);
     zxlogf(TRACE, "sdmmc: do_txn complete\n");
 }
 
@@ -520,7 +433,6 @@ static int sdmmc_worker_thread(void* arg) {
             // between each txn.
             SDMMC_LOCK(dev);
             sdmmc_txn_t* txn = list_remove_head_type(&dev->txn_list, sdmmc_txn_t, node);
-            STAT_DEC_IF(pending, txn != NULL);
             if (txn) {
                 // Unlock if we execute the transaction
                 SDMMC_UNLOCK(dev);
@@ -560,8 +472,8 @@ static zx_status_t sdmmc_bind(void* ctx, zx_device_t* parent) {
     zx_status_t st = device_get_protocol(parent, ZX_PROTOCOL_SDMMC, &dev->host);
     if (st != ZX_OK) {
         zxlogf(ERROR, "sdmmc: failed to get sdmmc protocol\n");
-        st = ZX_ERR_NOT_SUPPORTED;
-        goto fail;
+        free(dev);
+        return ZX_ERR_NOT_SUPPORTED;
     }
 
     mtx_init(&dev->lock, mtx_plain);
@@ -580,25 +492,18 @@ static zx_status_t sdmmc_bind(void* ctx, zx_device_t* parent) {
 
     st = device_add(parent, &block_args, &dev->zxdev);
     if (st != ZX_OK) {
-        goto fail;
+        free(dev);
+        return st;
     }
-
-    // Register the tracing interface
-    register_trace(dev);
 
     // bootstrap in a thread
     int rc = thrd_create_with_name(&dev->worker_thread, sdmmc_worker_thread, dev, "sdmmc-worker");
     if (rc != thrd_success) {
         st = thrd_status_to_zx_status(rc);
-        goto fail_remove;
+        device_remove(dev->zxdev);
+        return st;
     }
     return ZX_OK;
-
-fail_remove:
-    device_remove(dev->zxdev);
-fail:
-    free(dev);
-    return st;
 }
 
 static zx_driver_ops_t sdmmc_driver_ops = {

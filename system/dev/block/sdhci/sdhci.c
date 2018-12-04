@@ -24,8 +24,10 @@
 #include <ddk/debug.h>
 #include <ddk/io-buffer.h>
 #include <ddk/phys-iter.h>
+#include <ddk/protocol/block.h>
 #include <ddk/protocol/sdmmc.h>
 #include <ddk/protocol/sdhci.h>
+#include <hw/sdhci.h>
 #include <hw/sdmmc.h>
 
 // Zircon Includes

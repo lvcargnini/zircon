@@ -22,16 +22,11 @@
 #include <lib/fdio/io.h>
 #include <lib/fdio/remoteio.h>
 #include <lib/fdio/util.h>
-#include <lib/zxs/protocol.h>
+#include <lib/zxs/zxs.h>
 
 #include "private.h"
+#include "private-socket.h"
 #include "unistd.h"
-
-zx_status_t zxsio_accept(fdio_t* io, zx_handle_t* s2);
-
-static zx_status_t fdio_getsockopt(fdio_t* io, int level, int optname,
-                                   void* restrict optval,
-                                   socklen_t* restrict optlen);
 
 static zx_status_t get_service_handle(const char* path, zx_handle_t* saved,
                                       mtx_t* lock, zx_handle_t* out) {
@@ -70,12 +65,6 @@ static zx_status_t get_service_with_retries(const char* path, zx_handle_t* saved
         zx_nanosleep(zx_deadline_after((retry < 8) ? ZX_MSEC(250) : ZX_MSEC(500)));
     }
     return r;
-}
-
-static zx_status_t get_dns(zx_handle_t* out) {
-    static zx_handle_t saved = ZX_HANDLE_INVALID;
-    static mtx_t lock = MTX_INIT;
-    return get_service_with_retries("/svc/dns.DNS", &saved, &lock, out);
 }
 
 static zx_status_t get_socket_provider(zx_handle_t* out) {
@@ -136,86 +125,54 @@ int socket(int domain, int type, int protocol) {
 
 __EXPORT
 int connect(int fd, const struct sockaddr* addr, socklen_t len) {
-    fdio_t* io = fd_to_io(fd);
+    const zxs_socket_t* socket = NULL;
+    fdio_t* io = fd_to_socket(fd, &socket);
     if (io == NULL) {
         return ERRNO(EBADF);
     }
 
-    zx_status_t r;
-    r = io->ops->misc(io, ZXSIO_CONNECT, 0, 0, (void*)addr, len);
-    if (r == ZX_ERR_SHOULD_WAIT) {
-        if (io->ioflag & IOFLAG_NONBLOCK) {
-            io->ioflag |= IOFLAG_SOCKET_CONNECTING;
-            fdio_release(io);
-            return ERRNO(EINPROGRESS);
-        }
-        // going to wait for the completion
-    } else {
-        if (r == ZX_OK) {
-            io->ioflag |= IOFLAG_SOCKET_CONNECTED;
-        }
+    zx_status_t status = zxs_connect(socket, addr, len);
+    if (status == ZX_ERR_SHOULD_WAIT) {
+        io->ioflag |= IOFLAG_SOCKET_CONNECTING;
         fdio_release(io);
-        return STATUS(r);
-    }
-
-    // wait for the completion
-    uint32_t events = POLLOUT;
-    zx_handle_t h;
-    zx_signals_t sigs;
-    io->ops->wait_begin(io, events, &h, &sigs);
-    r = zx_object_wait_one(h, sigs, ZX_TIME_INFINITE, &sigs);
-    io->ops->wait_end(io, sigs, &events);
-    if (!(events & POLLOUT)) {
-        fdio_release(io);
-        return ERRNO(EIO);
-    }
-    if (r < 0) {
-        fdio_release(io);
-        return ERROR(r);
-    }
-
-    // check the result
-    zx_status_t status;
-    socklen_t status_len = sizeof(status);
-    r = fdio_getsockopt(io, SOL_SOCKET, SO_ERROR, &status, &status_len);
-    if (r < 0) {
-        fdio_release(io);
-        return ERRNO(EIO);
-    }
-    if (status == ZX_OK) {
+        return ERRNO(EINPROGRESS);
+    } else if (status == ZX_OK) {
         io->ioflag |= IOFLAG_SOCKET_CONNECTED;
     }
     fdio_release(io);
-    if (status != ZX_OK) {
-        return ERRNO(fdio_status_to_errno(status));
-    }
-    return 0;
+    return STATUS(status);
 }
 
 __EXPORT
 int bind(int fd, const struct sockaddr* addr, socklen_t len) {
-    fdio_t* io = fd_to_io(fd);
+    const zxs_socket_t* socket;
+    fdio_t* io = fd_to_socket(fd, &socket);
     if (io == NULL) {
         return ERRNO(EBADF);
     }
 
-    zx_status_t r;
-    r = io->ops->misc(io, ZXSIO_BIND, 0, 0, (void*)addr, len);
+    zx_status_t status = zxs_bind(socket, addr, len);
     fdio_release(io);
-    return STATUS(r);
+    return STATUS(status);
 }
 
 __EXPORT
 int listen(int fd, int backlog) {
-    fdio_t* io = fd_to_io(fd);
+    const zxs_socket_t* socket;
+    fdio_t* io = fd_to_socket(fd, &socket);
     if (io == NULL) {
         return ERRNO(EBADF);
     }
 
-    zx_status_t r;
-    r = io->ops->misc(io, ZXSIO_LISTEN, 0, 0, &backlog, sizeof(backlog));
+    zx_status_t status = zxs_listen(socket, backlog);
+
+    if (status == ZX_OK) {
+        zxsio_t* sio = (zxsio_t*)io;
+        sio->flags |= ZXSIO_DID_LISTEN;
+    }
+
     fdio_release(io);
-    return STATUS(r);
+    return STATUS(status);
 }
 
 __EXPORT
@@ -225,22 +182,31 @@ int accept4(int fd, struct sockaddr* restrict addr, socklen_t* restrict len,
         return ERRNO(EINVAL);
     }
 
-    fdio_t* io = fd_to_io(fd);
+    const zxs_socket_t* socket = NULL;
+    fdio_t* io = fd_to_socket(fd, &socket);
     if (io == NULL) {
         return ERRNO(EBADF);
     }
 
-    zx_handle_t s2;
-    zx_status_t r = zxsio_accept(io, &s2);
-    fdio_release(io);
-    if (r == ZX_ERR_SHOULD_WAIT) {
-        return ERRNO(EWOULDBLOCK);
-    } else if (r != ZX_OK) {
-        return ERROR(r);
+    zxsio_t* sio = (zxsio_t*)io;
+    if (!(sio->flags & ZXSIO_DID_LISTEN)) {
+        fdio_release(io);
+        return ERROR(ZX_ERR_BAD_STATE);
     }
 
-    fdio_t* io2;
-    if ((io2 = fdio_socket_create_stream(s2, IOFLAG_SOCKET_CONNECTED)) == NULL) {
+    size_t actual = 0u;
+    zxs_socket_t accepted;
+    memset(&accepted, 0, sizeof(accepted));
+    zx_status_t status = zxs_accept(socket, addr, len ? *len : 0u, &actual, &accepted);
+    fdio_release(io);
+    if (status == ZX_ERR_SHOULD_WAIT) {
+        return ERRNO(EWOULDBLOCK);
+    } else if (status != ZX_OK) {
+        return ERROR(status);
+    }
+
+    fdio_t* io2 = NULL;
+    if ((io2 = fdio_socket_create_stream(accepted.socket, IOFLAG_SOCKET_CONNECTED)) == NULL) {
         return ERROR(ZX_ERR_NO_RESOURCES);
     }
 
@@ -248,18 +214,8 @@ int accept4(int fd, struct sockaddr* restrict addr, socklen_t* restrict len,
         io2->ioflag |= IOFLAG_NONBLOCK;
     }
 
-    if (addr != NULL && len != NULL) {
-        zxrio_sockaddr_reply_t reply;
-        if ((r = io2->ops->misc(io2, ZXSIO_GETPEERNAME, 0,
-                                sizeof(zxrio_sockaddr_reply_t), &reply,
-                                sizeof(reply))) < 0) {
-            io->ops->close(io2);
-            fdio_release(io2);
-            return ERROR(r);
-        }
-        socklen_t avail = *len;
-        *len = reply.len;
-        memcpy(addr, &reply.addr, (avail < reply.len) ? avail : reply.len);
+    if (len != NULL) {
+        *len = actual;
     }
 
     int fd2;
@@ -434,70 +390,53 @@ void freeaddrinfo(struct addrinfo* res) {
     free(res);
 }
 
-static int getsockaddr(int fd, int op, struct sockaddr* restrict addr,
-                       socklen_t* restrict len) {
+__EXPORT
+int getsockname(int fd, struct sockaddr* restrict addr, socklen_t* restrict len) {
     if (len == NULL || addr == NULL) {
         return ERRNO(EINVAL);
     }
 
-    fdio_t* io = fd_to_io(fd);
+    const zxs_socket_t* socket = NULL;
+    fdio_t* io = fd_to_socket(fd, &socket);
     if (io == NULL) {
         return ERRNO(EBADF);
     }
 
-    zxrio_sockaddr_reply_t reply;
-    zx_status_t r = io->ops->misc(io, op, 0, sizeof(zxrio_sockaddr_reply_t),
-                                  &reply, sizeof(reply));
-    fdio_release(io);
-
-    if (r < 0) {
-        return ERROR(r);
+    size_t actual = 0u;
+    zx_status_t status = zxs_getsockname(socket, addr, *len, &actual);
+    if (status == ZX_OK) {
+        *len = actual;
     }
-
-    socklen_t avail = *len;
-    *len = reply.len;
-    memcpy(addr, &reply.addr, (avail < reply.len) ? avail : reply.len);
-
-    return 0;
-}
-
-__EXPORT
-int getsockname(int fd, struct sockaddr* restrict addr, socklen_t* restrict len) {
-    return getsockaddr(fd, ZXSIO_GETSOCKNAME, addr, len);
+    fdio_release(io);
+    return STATUS(status);
 }
 
 __EXPORT
 int getpeername(int fd, struct sockaddr* restrict addr, socklen_t* restrict len) {
-    return getsockaddr(fd, ZXSIO_GETPEERNAME, addr, len);
-}
-
-static zx_status_t fdio_getsockopt(fdio_t* io, int level, int optname,
-                                   void* restrict optval, socklen_t* restrict optlen) {
-    if (optval == NULL || optlen == NULL) {
+    if (len == NULL || addr == NULL) {
         return ERRNO(EINVAL);
     }
 
-    zxrio_sockopt_req_reply_t req_reply;
-    req_reply.level = level;
-    req_reply.optname = optname;
-    zx_status_t r = io->ops->misc(io, ZXSIO_GETSOCKOPT, 0,
-                                  sizeof(zxrio_sockopt_req_reply_t),
-                                  &req_reply, sizeof(req_reply));
-    if (r < 0) {
-        return r;
+    const zxs_socket_t* socket = NULL;
+    fdio_t* io = fd_to_socket(fd, &socket);
+    if (io == NULL) {
+        return ERRNO(EBADF);
     }
-    socklen_t avail = *optlen;
-    *optlen = req_reply.optlen;
-    memcpy(optval, req_reply.optval,
-           (avail < req_reply.optlen) ? avail : req_reply.optlen);
 
-    return ZX_OK;
+    size_t actual = 0u;
+    zx_status_t status = zxs_getpeername(socket, addr, *len, &actual);
+    if (status == ZX_OK) {
+        *len = actual;
+    }
+    fdio_release(io);
+    return STATUS(status);
 }
 
 __EXPORT
 int getsockopt(int fd, int level, int optname, void* restrict optval,
                socklen_t* restrict optlen) {
-    fdio_t* io = fd_to_io(fd);
+    const zxs_socket_t* socket = NULL;
+    fdio_t* io = fd_to_socket(fd, &socket);
     if (io == NULL) {
         return ERRNO(EBADF);
     }
@@ -508,8 +447,9 @@ int getsockopt(int fd, int level, int optname, void* restrict optval,
             r = ZX_ERR_INVALID_ARGS;
         } else {
             zx_status_t status;
-            socklen_t status_len = sizeof(status);
-            r = fdio_getsockopt(io, SOL_SOCKET, SO_ERROR, &status, &status_len);
+            size_t actual = 0u;
+            r = zxs_getsockopt(socket, SOL_SOCKET, SO_ERROR, &status,
+                               sizeof(status), &actual);
             if (r == ZX_OK) {
                 int errno_ = 0;
                 if (status != ZX_OK) {
@@ -520,7 +460,15 @@ int getsockopt(int fd, int level, int optname, void* restrict optval,
             }
         }
     } else {
-        r = fdio_getsockopt(io, level, optname, optval, optlen);
+        if (optval == NULL || optlen == NULL) {
+            r = ZX_ERR_INVALID_ARGS;
+        } else {
+            size_t actual = 0u;
+            r = zxs_getsockopt(socket, level, optname, optval, *optlen, &actual);
+            if (r == ZX_OK) {
+                *optlen = actual;
+            }
+        }
     }
     fdio_release(io);
 
@@ -530,22 +478,20 @@ int getsockopt(int fd, int level, int optname, void* restrict optval,
 __EXPORT
 int setsockopt(int fd, int level, int optname, const void* optval,
                socklen_t optlen) {
-    fdio_t* io = fd_to_io(fd);
+    const zxs_socket_t* socket = NULL;
+    fdio_t* io = fd_to_socket(fd, &socket);
     if (io == NULL) {
         return ERRNO(EBADF);
     }
 
-    zxrio_sockopt_req_reply_t req;
-    req.level = level;
-    req.optname = optname;
-    if (optlen > sizeof(req.optval)) {
-        fdio_release(io);
-        return ERRNO(EINVAL);
-    }
-    memcpy(req.optval, optval, optlen);
-    req.optlen = optlen;
-    zx_status_t r = io->ops->misc(io, ZXSIO_SETSOCKOPT, 0, 0, &req,
-                                  sizeof(req));
+    zxs_option_t option = {
+        .level = level,
+        .name = optname,
+        .value = optval,
+        .length = optlen,
+    };
+
+    zx_status_t status = zxs_setsockopts(socket, &option, 1u);
     fdio_release(io);
-    return STATUS(r);
+    return STATUS(status);
 }

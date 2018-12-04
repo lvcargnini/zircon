@@ -47,6 +47,7 @@ class TestDevice final {
 public:
     explicit TestDevice();
     ~TestDevice();
+    DISALLOW_COPY_ASSIGN_AND_MOVE(TestDevice);
 
     // ACCESSORS
 
@@ -149,20 +150,21 @@ public:
     bool ReadVmo(zx_off_t off, size_t len);
     bool WriteVmo(zx_off_t off, size_t len);
 
-    // Test helper that flips a (pseudo)random bit in the byte at the given |offset| on the block
-    // device.  The call to |srand| in main.c guarantees the same bit will be chosen for a given
+    // Test helper that flips a (pseudo)random bit in the key at the given |slot| in the given
+    // |block|. The call to |srand| in main.c guarantees the same bit will be chosen for a given
     // test iteration.
-    bool Corrupt(zx_off_t offset);
+    bool Corrupt(uint64_t block, key_slot_t slot);
 
 private:
-    DISALLOW_COPY_ASSIGN_AND_MOVE(TestDevice);
-
     // Allocates a new ramdisk of at least |device_size| bytes arranged into blocks of |block_size|
     // bytes, and opens it.
     bool CreateRamdisk(size_t device_size, size_t block_size);
 
     // Destroys the ramdisk, killing any active transactions
     void DestroyRamdisk();
+
+    // Waits until idle, rebinds a ramdisk, and waits until it has been removed.
+    static zx_status_t RebindWatcher(int dirfd, int event, const char* fn, void* cookie);
 
     // Creates a ramdisk of with enough blocks of |block_size| bytes to hold both FVM metadata and
     // an FVM partition of at least |device_size| bytes.  It formats the ramdisk to be an FVM

@@ -25,20 +25,30 @@
 #include <lib/fdio/util.h>
 #include <lib/fdio/remoteio.h>
 #include <lib/fidl/coding.h>
+#include <lib/zx/debuglog.h>
+#include <lib/zx/resource.h>
 #include <lib/zx/vmo.h>
 #include <zxcpp/new.h>
 
-#include "devcoordinator.h"
 #include "devhost.h"
 #include "devhost-main.h"
+#include "devhost-shared.h"
+#if ENABLE_DRIVER_TRACING
+#include "devhost-tracing.h"
+#endif
 #include "log.h"
+
+zx_status_t zx_driver::Create(fbl::RefPtr<zx_driver>* out_driver) {
+    *out_driver = fbl::AdoptRef(new zx_driver());
+    return ZX_OK;
+}
 
 namespace devmgr {
 
 uint32_t log_flags = LOG_ERROR | LOG_INFO;
 
-struct proxy_iostate {
-    proxy_iostate() = default;
+struct ProxyIostate {
+    ProxyIostate() = default;
 
     zx_device_t* dev = nullptr;
     port_handler_t ph = {};
@@ -46,22 +56,22 @@ struct proxy_iostate {
 static void proxy_ios_create(zx_device_t* dev, zx_handle_t h);
 static void proxy_ios_destroy(zx_device_t* dev);
 
-#define proxy_ios_from_ph(ph) containerof(ph, proxy_iostate_t, ph)
+#define proxy_ios_from_ph(ph) containerof(ph, ProxyIostate, ph)
 
-#define ios_from_ph(ph) containerof(ph, devhost_iostate_t, ph)
+#define ios_from_ph(ph) containerof(ph, DevhostIostate, ph)
 
 static zx_status_t dh_handle_dc_rpc(port_handler_t* ph, zx_signals_t signals, uint32_t evt);
 
 static port_t dh_port;
 
-static devhost_iostate_t root_ios = []() {
-    devhost_iostate_t ios;
+static DevhostIostate root_ios = []() {
+    DevhostIostate ios;
     ios.ph.waitfor = ZX_CHANNEL_READABLE | ZX_CHANNEL_PEER_CLOSED;
     ios.ph.func = dh_handle_dc_rpc;
     return ios;
 }();
 
-static fbl::DoublyLinkedList<fbl::unique_ptr<zx_driver>> dh_drivers;
+static fbl::DoublyLinkedList<fbl::RefPtr<zx_driver>> dh_drivers;
 
 static const char* mkdevpath(zx_device_t* dev, char* path, size_t max) {
     if (dev == nullptr) {
@@ -127,69 +137,69 @@ static void logflag(char* flag, uint32_t* flags) {
     }
 }
 
-static zx_status_t dh_find_driver(const char* libname, zx::vmo vmo, zx_driver_t** out) {
+static zx_status_t dh_find_driver(const char* libname, zx::vmo vmo, fbl::RefPtr<zx_driver_t>* out) {
     // check for already-loaded driver first
     for (auto& drv : dh_drivers) {
-        if (!strcmp(libname, drv.libname.c_str())) {
-            *out = &drv;
-            return drv.status;
+        if (!strcmp(libname, drv.libname().c_str())) {
+            *out = fbl::RefPtr(&drv);
+            return drv.status();
         }
     }
 
-    // TODO(kulakowski/teisenbe): This should probably be a RefPtr
-    auto new_driver = fbl::make_unique<zx_driver_t>();
-    if (new_driver == nullptr) {
-        return ZX_ERR_NO_MEMORY;
+    fbl::RefPtr<zx_driver> new_driver;
+    zx_status_t status = zx_driver::Create(&new_driver);
+    if (status != ZX_OK) {
+        return status;
     }
-    new_driver->libname.Set(libname);
-    zx_driver_t* drv = new_driver.get();
-    dh_drivers.push_back(fbl::move(new_driver));
-    *out = drv;
+    new_driver->set_libname(libname);
+
+    // Let the |dh_drivers| list and our out parameter each have a refcount.
+    dh_drivers.push_back(new_driver);
+    *out = new_driver;
 
     void* dl = dlopen_vmo(vmo.get(), RTLD_NOW);
     if (dl == nullptr) {
         log(ERROR, "devhost: cannot load '%s': %s\n", libname, dlerror());
-        drv->status = ZX_ERR_IO;
-        return drv->status;
+        new_driver->set_status(ZX_ERR_IO);
+        return new_driver->status();
     }
 
     const zircon_driver_note_t* dn;
     dn = static_cast<const zircon_driver_note_t*>(dlsym(dl, "__zircon_driver_note__"));
     if (dn == nullptr) {
         log(ERROR, "devhost: driver '%s' missing __zircon_driver_note__ symbol\n", libname);
-        drv->status = ZX_ERR_IO;
-        return drv->status;
+        new_driver->set_status(ZX_ERR_IO);
+        return new_driver->status();
     }
     zx_driver_rec_t* dr;
     dr = static_cast<zx_driver_rec_t*>(dlsym(dl, "__zircon_driver_rec__"));
     if (dr == nullptr) {
         log(ERROR, "devhost: driver '%s' missing __zircon_driver_rec__ symbol\n", libname);
-        drv->status = ZX_ERR_IO;
-        return drv->status;
+        new_driver->set_status(ZX_ERR_IO);
+        return new_driver->status();
     }
     if (!dr->ops) {
         log(ERROR, "devhost: driver '%s' has nullptr ops\n", libname);
-        drv->status = ZX_ERR_INVALID_ARGS;
-        return drv->status;
+        new_driver->set_status(ZX_ERR_INVALID_ARGS);
+        return new_driver->status();
     }
     if (dr->ops->version != DRIVER_OPS_VERSION) {
         log(ERROR, "devhost: driver '%s' has bad driver ops version %" PRIx64
             ", expecting %" PRIx64 "\n", libname,
             dr->ops->version, DRIVER_OPS_VERSION);
-        drv->status = ZX_ERR_INVALID_ARGS;
-        return drv->status;
+        new_driver->set_status(ZX_ERR_INVALID_ARGS);
+        return new_driver->status();
     }
 
-    drv->driver_rec = dr;
-    drv->name = dn->payload.name;
-    drv->ops = dr->ops;
-    dr->driver = drv;
+    new_driver->set_driver_rec(dr);
+    new_driver->set_name(dn->payload.name);
+    new_driver->set_ops(dr->ops);
+    dr->driver = new_driver.get();
 
     // check for dprintf log level flags
     char tmp[128];
-    snprintf(tmp, sizeof(tmp), "driver.%s.log", drv->name);
-    char* log;
-    log = getenv(tmp);
+    snprintf(tmp, sizeof(tmp), "driver.%s.log", new_driver->name());
+    char* log = getenv(tmp);
     if (log) {
         while (log) {
             char* sep = strchr(log, ',');
@@ -203,26 +213,26 @@ static zx_status_t dh_find_driver(const char* libname, zx::vmo vmo, zx_driver_t*
                 break;
             }
         }
-        log(INFO, "devhost: driver '%s': log flags set to: 0x%x\n", drv->name, dr->log_flags);
+        log(INFO, "devhost: driver '%s': log flags set to: 0x%x\n", new_driver->name(), dr->log_flags);
     }
 
-    if (drv->ops->init) {
-        drv->status = drv->ops->init(&drv->ctx);
-        if (drv->status < 0) {
+    if (new_driver->has_init_op()) {
+        new_driver->set_status(new_driver->InitOp());
+        if (new_driver->status() != ZX_OK) {
             log(ERROR, "devhost: driver '%s' failed in init: %d\n",
-                libname, drv->status);
+                libname, new_driver->status());
         }
     } else {
-        drv->status = ZX_OK;
+        new_driver->set_status(ZX_OK);
     }
 
-    return drv->status;
+    return new_driver->status();
 }
 
 static void dh_send_status(zx_handle_t h, zx_status_t status) {
-    dc_msg_t reply = {};
+    Message reply = {};
     reply.txid = 0;
-    reply.op = dc_msg_t::Op::kStatus;
+    reply.op = Message::Op::kStatus;
     reply.status = status;
     zx_channel_write(h, 0, &reply, sizeof(reply), nullptr, 0);
 }
@@ -235,8 +245,8 @@ static fidl_txn_t dh_null_txn = {
     .reply = dh_null_reply,
 };
 
-static zx_status_t dh_handle_rpc_read(zx_handle_t h, devhost_iostate_t* ios) {
-    dc_msg_t msg;
+static zx_status_t dh_handle_rpc_read(zx_handle_t h, DevhostIostate* ios) {
+    Message msg;
     zx_handle_t hin[3];
     uint32_t msize = sizeof(msg);
     uint32_t hcount = 3;
@@ -276,13 +286,13 @@ static zx_status_t dh_handle_rpc_read(zx_handle_t h, devhost_iostate_t* ios) {
         goto fail;
     }
     switch (msg.op) {
-    case dc_msg_t::Op::kCreateDeviceStub: {
+    case Message::Op::kCreateDeviceStub: {
         log(RPC_IN, "devhost[%s] create device stub drv='%s'\n", path, name);
         if (hcount != 1) {
             r = ZX_ERR_INVALID_ARGS;
             goto fail;
         }
-        auto newios = fbl::make_unique<devhost_iostate_t>();
+        auto newios = fbl::make_unique<DevhostIostate>();
         if (!newios) {
             r = ZX_ERR_NO_MEMORY;
             break;
@@ -298,7 +308,7 @@ static zx_status_t dh_handle_rpc_read(zx_handle_t h, devhost_iostate_t* ios) {
         strcpy(dev->name, "proxy");
         dev->protocol_id = msg.protocol_id;
         dev->ops = &device_default_ops;
-        dev->rpc = hin[0];
+        dev->rpc.reset(hin[0]);
         dev->refcount = 1;
         newios->dev = dev.get();
 
@@ -316,7 +326,7 @@ static zx_status_t dh_handle_rpc_read(zx_handle_t h, devhost_iostate_t* ios) {
         return ZX_OK;
     }
 
-    case dc_msg_t::Op::kCreateDevice: {
+    case Message::Op::kCreateDevice: {
         // This does not operate under the devhost api lock,
         // since the newly created device is not visible to
         // any API surface until a driver is bound to it.
@@ -330,7 +340,7 @@ static zx_status_t dh_handle_rpc_read(zx_handle_t h, devhost_iostate_t* ios) {
             r = ZX_ERR_INVALID_ARGS;
             break;
         }
-        auto newios = fbl::make_unique<devhost_iostate_t>();
+        auto newios = fbl::make_unique<DevhostIostate>();
         if (!newios) {
             r = ZX_ERR_NO_MEMORY;
             break;
@@ -339,24 +349,24 @@ static zx_status_t dh_handle_rpc_read(zx_handle_t h, devhost_iostate_t* ios) {
         // named driver -- ask it to create the device
         zx::vmo vmo(hin[1]);
         hin[1] = ZX_HANDLE_INVALID;
-        zx_driver_t* drv;
+        fbl::RefPtr<zx_driver_t> drv;
         if ((r = dh_find_driver(name, fbl::move(vmo), &drv)) < 0) {
             log(ERROR, "devhost[%s] driver load failed: %d\n", path, r);
             break;
         }
-        if (drv->ops->create) {
+        if (drv->has_create_op()) {
             // magic cookie for device create handshake
             zx_device_t parent = {};
             char dummy_name[sizeof(parent.name)] = "device_create dummy";
             memcpy(&parent.name, &dummy_name, sizeof(parent.name));
 
-            creation_context_t ctx = {
+            CreationContext ctx = {
                 .parent = &parent,
                 .child = nullptr,
                 .rpc = hin[0],
             };
             devhost_set_creation_context(&ctx);
-            r = drv->ops->create(drv->ctx, &parent, "proxy", args, hin[2]);
+            r = drv->CreateOp(&parent, "proxy", args, hin[2]);
             devhost_set_creation_context(nullptr);
 
             if (r < 0) {
@@ -388,14 +398,14 @@ static zx_status_t dh_handle_rpc_read(zx_handle_t h, devhost_iostate_t* ios) {
         return ZX_OK;
     }
 
-    case dc_msg_t::Op::kBindDriver:
+    case Message::Op::kBindDriver: {
         if (hcount != 1) {
             r = ZX_ERR_INVALID_ARGS;
             break;
         }
         //TODO: api lock integration
         log(RPC_IN, "devhost[%s] bind driver '%s'\n", path, name);
-        zx_driver_t* drv;
+        fbl::RefPtr<zx_driver> drv;
         if (ios->dev->flags & DEV_FLAG_DEAD) {
             log(ERROR, "devhost[%s] bind to removed device disallowed\n", path);
             r = ZX_ERR_IO_NOT_PRESENT;
@@ -404,14 +414,14 @@ static zx_status_t dh_handle_rpc_read(zx_handle_t h, devhost_iostate_t* ios) {
             hin[0] = ZX_HANDLE_INVALID;
             if ((r = dh_find_driver(name, fbl::move(vmo), &drv)) < 0) {
                 log(ERROR, "devhost[%s] driver load failed: %d\n", path, r);
-            } else if (drv->ops->bind) {
-                creation_context_t ctx = {
+            } else if (drv->has_bind_op()) {
+                CreationContext ctx = {
                     .parent = ios->dev,
                     .child = nullptr,
                     .rpc = ZX_HANDLE_INVALID,
                 };
                 devhost_set_creation_context(&ctx);
-                r = drv->ops->bind(drv->ctx, ios->dev);
+                r = drv->BindOp(ios->dev);
                 devhost_set_creation_context(nullptr);
 
                 if ((r == ZX_OK) && (ctx.child == nullptr)) {
@@ -421,7 +431,7 @@ static zx_status_t dh_handle_rpc_read(zx_handle_t h, devhost_iostate_t* ios) {
                     log(ERROR, "devhost[%s] bind driver '%s' failed: %d\n", path, name, r);
                 }
             } else {
-                if (!drv->ops->create) {
+                if (!drv->has_create_op()) {
                     log(ERROR, "devhost[%s] neither create nor bind are implemented: '%s'\n",
                         path, name);
                 }
@@ -430,8 +440,9 @@ static zx_status_t dh_handle_rpc_read(zx_handle_t h, devhost_iostate_t* ios) {
         }
         dh_send_status(h, r);
         return ZX_OK;
+    }
 
-    case dc_msg_t::Op::kConnectProxy:
+    case Message::Op::kConnectProxy:
         if (hcount != 1) {
             r = ZX_ERR_INVALID_ARGS;
             break;
@@ -441,7 +452,7 @@ static zx_status_t dh_handle_rpc_read(zx_handle_t h, devhost_iostate_t* ios) {
         proxy_ios_create(ios->dev, hin[0]);
         return ZX_OK;
 
-    case dc_msg_t::Op::kSuspend: {
+    case Message::Op::kSuspend: {
         if (hcount != 0) {
             r = ZX_ERR_INVALID_ARGS;
             break;
@@ -458,7 +469,7 @@ static zx_status_t dh_handle_rpc_read(zx_handle_t h, devhost_iostate_t* ios) {
         return ZX_OK;
     }
 
-    case dc_msg_t::Op::kRemoveDevice:
+    case Message::Op::kRemoveDevice:
         if (hcount != 0) {
             r = ZX_ERR_INVALID_ARGS;
             break;
@@ -480,7 +491,7 @@ fail:
 
 // handles devcoordinator rpc
 static zx_status_t dh_handle_dc_rpc(port_handler_t* ph, zx_signals_t signals, uint32_t evt) {
-    devhost_iostate_t* ios = ios_from_ph(ph);
+    DevhostIostate* ios = ios_from_ph(ph);
 
     if (evt != 0) {
         // we send an event to request the destruction
@@ -513,7 +524,7 @@ static zx_status_t dh_handle_dc_rpc(port_handler_t* ph, zx_signals_t signals, ui
 
 // handles remoteio rpc
 static zx_status_t dh_handle_fidl_rpc(port_handler_t* ph, zx_signals_t signals, uint32_t evt) {
-    devhost_iostate_t* ios = ios_from_ph(ph);
+    DevhostIostate* ios = ios_from_ph(ph);
 
     zx_status_t r;
     if (signals & ZX_CHANNEL_READABLE) {
@@ -542,7 +553,7 @@ static zx_status_t dh_handle_fidl_rpc(port_handler_t* ph, zx_signals_t signals, 
 // Handling RPC From Proxy Devices to BusDevs
 
 static zx_status_t dh_handle_proxy_rpc(port_handler_t* ph, zx_signals_t signals, uint32_t evt) {
-    proxy_iostate_t* ios = proxy_ios_from_ph(ph);
+    ProxyIostate* ios = proxy_ios_from_ph(ph);
 
     if (evt != 0) {
         // TODO(kulakowski/teisenbe): Can |ios->dev| still have a reference to
@@ -588,7 +599,7 @@ static void proxy_ios_create(zx_device_t* dev, zx_handle_t h) {
         proxy_ios_destroy(dev);
     }
 
-    auto ios = fbl::make_unique<proxy_iostate>();
+    auto ios = fbl::make_unique<ProxyIostate>();
     if (ios == nullptr) {
         zx_handle_close(h);
         return;
@@ -608,7 +619,7 @@ static void proxy_ios_create(zx_device_t* dev, zx_handle_t h) {
 }
 
 static void proxy_ios_destroy(zx_device_t* dev) {
-    proxy_iostate_t* ios = dev->proxy_ios;
+    ProxyIostate* ios = dev->proxy_ios;
     if (ios) {
         dev->proxy_ios = nullptr;
 
@@ -629,14 +640,14 @@ static void proxy_ios_destroy(zx_device_t* dev) {
 
 #define LOGBUF_MAX (ZX_LOG_RECORD_MAX - sizeof(zx_log_record_t))
 
-static zx_handle_t devhost_log_handle;
+static zx::debuglog devhost_log_handle;
 
 static ssize_t _devhost_log_write(uint32_t flags, const void* _data, size_t len) {
     struct Context {
         Context() = default;
 
         uint32_t next = 0;
-        zx_handle_t handle = ZX_HANDLE_INVALID;
+        zx::unowned_debuglog handle;
         char data[LOGBUF_MAX] = {};
     };
     static thread_local fbl::unique_ptr<Context> ctx;
@@ -646,7 +657,7 @@ static ssize_t _devhost_log_write(uint32_t flags, const void* _data, size_t len)
         if (ctx == nullptr) {
             return len;
         }
-        ctx->handle = devhost_log_handle;
+        ctx->handle = zx::unowned_debuglog(devhost_log_handle);
     }
 
     const char* data = static_cast<const char*>(_data);
@@ -657,7 +668,7 @@ static ssize_t _devhost_log_write(uint32_t flags, const void* _data, size_t len)
         if (c == '\n') {
             if (ctx->next) {
 flush_ctx:
-                zx_debuglog_write(ctx->handle, flags, ctx->data, ctx->next);
+                ctx->handle->write(flags, ctx->data, ctx->next);
                 ctx->next = 0;
             }
             continue;
@@ -696,7 +707,7 @@ static ssize_t devhost_log_write(void* cookie, const void* data, size_t len) {
 }
 
 static void devhost_io_init() {
-    if (zx_debuglog_create(ZX_HANDLE_INVALID, 0, &devhost_log_handle) < 0) {
+    if (zx::debuglog::create(zx::resource(), 0, &devhost_log_handle) < 0) {
         return;
     }
     fdio_t* io;
@@ -716,18 +727,18 @@ zx_status_t devhost_add(zx_device_t* parent, zx_device_t* child, const char* pro
     const char* path = mkdevpath(parent, buffer, sizeof(buffer));
     log(RPC_OUT, "devhost[%s] add '%s'\n", path, child->name);
 
-    const char* libname = child->driver->libname.c_str();
+    const char* libname = child->driver->libname().c_str();
     size_t namelen = strlen(libname) + strlen(child->name) + 2;
     char name[namelen];
     snprintf(name, namelen, "%s,%s", libname, child->name);
 
-    auto ios = fbl::make_unique<devhost_iostate_t>();
+    auto ios = fbl::make_unique<DevhostIostate>();
     if (!ios) {
         return ZX_ERR_NO_MEMORY;
     }
 
     zx_status_t r;
-    dc_msg_t msg;
+    Message msg;
     uint32_t msglen;
     if ((r = dc_msg_pack(&msg, &msglen,
                          props, prop_count * sizeof(zx_device_prop_t),
@@ -735,7 +746,7 @@ zx_status_t devhost_add(zx_device_t* parent, zx_device_t* child, const char* pro
         return r;
     }
     msg.op = (child->flags & DEV_FLAG_INVISIBLE) ?
-        dc_msg_t::Op::kAddDeviceInvisible : dc_msg_t::Op::kAddDevice;
+        Message::Op::kAddDeviceInvisible : Message::Op::kAddDevice;
     msg.protocol_id = child->protocol_id;
 
     // handles: remote endpoint, resource (optional)
@@ -744,8 +755,9 @@ zx_status_t devhost_add(zx_device_t* parent, zx_device_t* child, const char* pro
         return r;
     }
 
-    dc_status_t rsp;
-    if ((r = dc_msg_rpc(parent->rpc, &msg, msglen, &hsend, 1, &rsp, sizeof(rsp), nullptr, nullptr)) < 0) {
+    Status rsp;
+    if ((r = dc_msg_rpc(parent->rpc.get(), &msg, msglen, &hsend, 1, &rsp, sizeof(rsp), nullptr,
+                        nullptr)) < 0) {
         log(ERROR, "devhost[%s] add '%s': rpc failed: %d\n", path, child->name, r);
     } else {
         ios->dev = child;
@@ -753,7 +765,7 @@ zx_status_t devhost_add(zx_device_t* parent, zx_device_t* child, const char* pro
         ios->ph.waitfor = ZX_CHANNEL_READABLE | ZX_CHANNEL_PEER_CLOSED;
         ios->ph.func = dh_handle_dc_rpc;
         if ((r = port_wait(&dh_port, &ios->ph)) == ZX_OK) {
-            child->rpc = hrpc;
+            child->rpc.reset(hrpc);
             child->ios = ios.release();
             return ZX_OK;
         }
@@ -763,15 +775,15 @@ zx_status_t devhost_add(zx_device_t* parent, zx_device_t* child, const char* pro
     return r;
 }
 
-static zx_status_t devhost_rpc_etc(zx_device_t* dev, dc_msg_t::Op op,
+static zx_status_t devhost_rpc_etc(zx_device_t* dev, Message::Op op,
                                    const char* args, const char* opname,
                                    uint32_t value, const void* data, size_t datalen,
-                                   dc_status_t* rsp, size_t rsp_len, size_t* actual,
+                                   Status* rsp, size_t rsp_len, size_t* actual,
                                    zx_handle_t* outhandle) {
     char buffer[512];
     const char* path = mkdevpath(dev, buffer, sizeof(buffer));
     log(RPC_OUT, "devhost[%s] %s args='%s'\n", path, opname, args ? args : "");
-    dc_msg_t msg;
+    Message msg;
     uint32_t msglen;
     zx_status_t r;
     if ((r = dc_msg_pack(&msg, &msglen, data, datalen, nullptr, args)) < 0) {
@@ -779,31 +791,32 @@ static zx_status_t devhost_rpc_etc(zx_device_t* dev, dc_msg_t::Op op,
     }
     msg.op = op;
     msg.value = value;
-    if ((r = dc_msg_rpc(dev->rpc, &msg, msglen, nullptr, 0, rsp, rsp_len, actual, outhandle)) < 0) {
-        if (!(op == dc_msg_t::Op::kGetMetadata && r == ZX_ERR_NOT_FOUND)) {
+    if ((r = dc_msg_rpc(dev->rpc.get(), &msg, msglen, nullptr, 0, rsp, rsp_len, actual,
+                        outhandle)) < 0) {
+        if (!(op == Message::Op::kGetMetadata && r == ZX_ERR_NOT_FOUND)) {
             log(ERROR, "devhost: rpc:%s failed: %d\n", opname, r);
         }
     }
     return r;
 }
 
-static zx_status_t devhost_rpc(zx_device_t* dev, dc_msg_t::Op op,
+static zx_status_t devhost_rpc(zx_device_t* dev, Message::Op op,
                                const char* args, const char* opname,
-                               dc_status_t* rsp, size_t rsp_len,
+                               Status* rsp, size_t rsp_len,
                                zx_handle_t* outhandle) {
     return devhost_rpc_etc(dev, op, args, opname, 0, nullptr, 0, rsp, rsp_len, nullptr, outhandle);
 }
 
 void devhost_make_visible(zx_device_t* dev) {
-    dc_status_t rsp;
-    devhost_rpc(dev, dc_msg_t::Op::kMakeVisible, nullptr, "make-visible", &rsp,
+    Status rsp;
+    devhost_rpc(dev, Message::Op::kMakeVisible, nullptr, "make-visible", &rsp,
                 sizeof(rsp), nullptr);
 }
 
 // Send message to devcoordinator informing it that this device
 // is being removed.  Called under devhost api lock.
 zx_status_t devhost_remove(zx_device_t* dev) {
-    devhost_iostate_t* ios = static_cast<devhost_iostate_t*>(dev->ios);
+    DevhostIostate* ios = static_cast<DevhostIostate*>(dev->ios);
     if (ios == nullptr) {
         log(ERROR, "removing device %p, ios is nullptr\n", dev);
         return ZX_ERR_INTERNAL;
@@ -825,13 +838,12 @@ zx_status_t devhost_remove(zx_device_t* dev) {
     ios->ph.handle = ZX_HANDLE_INVALID;
     dev->ios = nullptr;
 
-    dc_status_t rsp;
-    devhost_rpc(dev, dc_msg_t::Op::kRemoveDevice, nullptr, "remove-device", &rsp,
+    Status rsp;
+    devhost_rpc(dev, Message::Op::kRemoveDevice, nullptr, "remove-device", &rsp,
                 sizeof(rsp), nullptr);
 
     // shut down our rpc channel
-    zx_handle_close(dev->rpc);
-    dev->rpc = ZX_HANDLE_INVALID;
+    dev->rpc.reset();
 
     // queue an event to destroy the iostate
     port_queue(&dh_port, &ios->ph, 1);
@@ -857,11 +869,11 @@ zx_status_t devhost_get_topo_path(zx_device_t* dev, char* path, size_t max, size
     }
 
     struct {
-        dc_status_t rsp;
+        Status rsp;
         char path[DC_PATH_MAX];
     } reply;
     zx_status_t r;
-    if ((r = devhost_rpc(remote_dev, dc_msg_t::Op::kGetTopoPath, nullptr, "get-topo-path",
+    if ((r = devhost_rpc(remote_dev, Message::Op::kGetTopoPath, nullptr, "get-topo-path",
                          &reply.rsp, sizeof(reply), nullptr)) < 0) {
         return r;
     }
@@ -878,8 +890,8 @@ zx_status_t devhost_get_topo_path(zx_device_t* dev, char* path, size_t max, size
 }
 
 zx_status_t devhost_device_bind(zx_device_t* dev, const char* drv_libname) {
-    dc_status_t rsp;
-    return devhost_rpc(dev, dc_msg_t::Op::kBindDevice, drv_libname,
+    Status rsp;
+    return devhost_rpc(dev, Message::Op::kBindDevice, drv_libname,
                        "bind-device", &rsp, sizeof(rsp), nullptr);
 }
 
@@ -890,11 +902,11 @@ zx_status_t devhost_load_firmware(zx_device_t* dev, const char* path,
     }
 
     struct {
-        dc_status_t rsp;
+        Status rsp;
         size_t size;
     } reply;
     zx_status_t r;
-    if ((r = devhost_rpc(dev, dc_msg_t::Op::kLoadFirmware, path, "load-firmware",
+    if ((r = devhost_rpc(dev, Message::Op::kLoadFirmware, path, "load-firmware",
                          &reply.rsp, sizeof(reply), vmo)) < 0) {
         return r;
     }
@@ -912,12 +924,12 @@ zx_status_t devhost_get_metadata(zx_device_t* dev, uint32_t type, void* buf, siz
     }
 
     struct {
-        dc_status_t rsp;
+        Status rsp;
         uint8_t data[DC_MAX_DATA];
     } reply;
     zx_status_t r;
     size_t resp_actual = 0;
-    if ((r = devhost_rpc_etc(dev, dc_msg_t::Op::kGetMetadata, nullptr, "get-metadata", type,
+    if ((r = devhost_rpc_etc(dev, Message::Op::kGetMetadata, nullptr, "get-metadata", type,
                              nullptr, 0, &reply.rsp, sizeof(reply), &resp_actual, nullptr)) < 0) {
         return r;
     }
@@ -938,30 +950,30 @@ zx_status_t devhost_get_metadata(zx_device_t* dev, uint32_t type, void* buf, siz
 
 zx_status_t devhost_add_metadata(zx_device_t* dev, uint32_t type, const void* data,
                                  size_t length) {
-    dc_status_t rsp;
+    Status rsp;
 
     if (!data && length) {
         return ZX_ERR_INVALID_ARGS;
     }
-    return devhost_rpc_etc(dev, dc_msg_t::Op::kAddMetadata, nullptr, "add-metadata", type, data,
+    return devhost_rpc_etc(dev, Message::Op::kAddMetadata, nullptr, "add-metadata", type, data,
                            length, &rsp, sizeof(rsp), nullptr, nullptr);
 }
 
 zx_status_t devhost_publish_metadata(zx_device_t* dev, const char* path, uint32_t type,
                                      const void* data, size_t length) {
-    dc_status_t rsp;
+    Status rsp;
 
     if (!path || (!data && length)) {
         return ZX_ERR_INVALID_ARGS;
     }
-    return devhost_rpc_etc(dev, dc_msg_t::Op::kPublishMetadata, path, "publish-metadata", type,
+    return devhost_rpc_etc(dev, Message::Op::kPublishMetadata, path, "publish-metadata", type,
                            data, length, &rsp, sizeof(rsp), nullptr, nullptr);
 }
 
 zx_handle_t root_resource_handle;
 
 
-zx_status_t devhost_start_iostate(fbl::unique_ptr<devhost_iostate_t> ios, zx::channel h) {
+zx_status_t devhost_start_iostate(fbl::unique_ptr<DevhostIostate> ios, zx::channel h) {
     ios->ph.handle = h.get();
     ios->ph.waitfor = ZX_CHANNEL_READABLE | ZX_CHANNEL_PEER_CLOSED;
     ios->ph.func = dh_handle_fidl_rpc;
@@ -991,6 +1003,20 @@ __EXPORT int device_host_main(int argc, char** argv) {
     }
 
     zx_status_t r;
+
+#if ENABLE_DRIVER_TRACING
+    {
+        const char* enable = getenv("driver.tracing.enable");
+        if (enable && strcmp(enable, "1") == 0) {
+            r = devhost_start_trace_provider();
+            if (r != ZX_OK) {
+                log(INFO, "devhost: error registering as trace provider: %d\n", r);
+                // This is not a fatal error.
+            }
+        }
+    }
+#endif
+
     if ((r = port_init(&dh_port)) < 0) {
         log(ERROR, "devhost: could not create port: %d\n", r);
         return -1;

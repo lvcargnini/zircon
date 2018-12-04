@@ -32,6 +32,9 @@ amlogic-canvas:
 bad-block:
 	$(run-banjo)
 
+block: $(LOCAL_DIR)/libs/block.banjo
+	$(run-banjo)
+
 bt-gatt-svc:
 	$(run-banjo)
 
@@ -93,7 +96,7 @@ rawnand: $(LOCAL_DIR)/libs/nand.banjo
 scpi:
 	$(run-banjo)
 
-sdhci: $(LOCAL_DIR)/libs/sdhci.banjo
+sdhci:
 	$(run-banjo)
 
 sdio:

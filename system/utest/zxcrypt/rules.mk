@@ -14,7 +14,6 @@ MODULE_SRCS += \
     $(LOCAL_DIR)/volume.cpp \
     $(LOCAL_DIR)/zxcrypt.cpp \
 
-
 MODULE_NAME := zxcrypt-test
 
 MODULE_COMPILEFLAGS += -Isystem/utest

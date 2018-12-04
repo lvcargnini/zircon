@@ -6,34 +6,24 @@
 # cipd is not available, it uses zircon.versions instead to deduce URLs to
 # download directly from Google Storage.
 #
-# This file is the source of truth and the bits in CIPD are the canonical
-# bits.  They're also copied to Google Storage with URLs derived from the
-# CIPD package name (shown below, with $ substituions for platform) and
-# instance ID (which is the SHA1 of the file).  zircon.versions is
-# generated from this file by querying CIPD to gather the instance IDs.
-#
 # NOTE! NOTE! NOTE!  After changing this file in any way, always run
-# scripts/update-prebuilt-versions to update the zircon.versions file with
-# specific instance IDs for each version listed here.  The two files must
-# be kept in lock-step so that scripts/download-prebuilt gets the same
-# contents whether it uses cipd or direct downloads.
-#
-# When adding new packages that are constructed by hand rather than by
-# automated bot builds (e.g. firmware), the CIPD packages must be copied to
-# Google Storage by running scripts/update-prebuilt-versions --upload with
-# appropriate credentials.
+# `scripts/download-prebuilt --resolve` to update the zircon.versions file
+# with specific instance IDs for each version listed here.  CIPD and
+# scripts/download-prebuilt both rely on the generated zircon.versions file
+# for exactly what to download and for content signatures to verify.
 
-# These lines tell scripts/update-prebuilt-versions what to look for.
-$VerifiedPlatform linux-amd64
-$VerifiedPlatform mac-amd64
-#MatchedPlatform linux-arm64
+$ResolvedVersions zircon.versions
 
 # This tells CIPD to fix up manually deleted files.
 $ParanoidMode CheckPresence
 
+# This tells CIPD to complain if ${...} references can't cover all of these.
+$VerifiedPlatform linux-amd64
+$VerifiedPlatform mac-amd64
+
 # Clang
 @Subdir clang
-fuchsia/clang/${platform} git_revision:1cadbeb9a6d8c7c36f3117bf1c9c7db5ce1ce6d2
+fuchsia/clang/${platform} git_revision:e26bce5269e367446e2adb259e2394ce4bd5235e
 
 # GCC
 @Subdir gcc
@@ -45,7 +35,7 @@ fuchsia/sysroot/${os=linux}-${arch} git_revision:a96053c799a0f1ad0b7e8ab8199edbf
 
 # Symbolizer tool.  This is a standalone executable, not a subdirectory.
 @Subdir
-fuchsia/tools/symbolize/${platform} git_revision:4f2007ecb0b2cdee974ad478305f3a7466d7ab77
+fuchsia/tools/symbolize/${platform} git_revision:37898ac8c132a7b4835ff528d6ed2791da2743c4
 
 # QEMU
 @Subdir qemu

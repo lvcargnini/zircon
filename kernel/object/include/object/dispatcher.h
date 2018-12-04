@@ -17,18 +17,18 @@
 #include <fbl/mutex.h>
 #include <fbl/recycler.h>
 #include <fbl/ref_counted.h>
+#include <fbl/ref_counted_upgradeable.h>
 #include <fbl/ref_ptr.h>
 #include <fbl/unique_ptr.h>
 
 #include <kernel/lockdep.h>
 #include <kernel/spinlock.h>
+#include <object/handle.h>
 #include <object/state_observer.h>
 
 #include <zircon/compiler.h>
 #include <zircon/syscalls/object.h>
 #include <zircon/types.h>
-
-class Handle;
 
 struct CookieJar {
     zx_koid_t scope_ = ZX_KOID_INVALID;
@@ -82,13 +82,13 @@ DECLARE_DISPTAG(SuspendTokenDispatcher, ZX_OBJ_TYPE_SUSPEND_TOKEN)
 //
 // You don't derive directly from this class; instead derive
 // from SoloDispatcher or PeeredDispatcher.
-class Dispatcher : private fbl::RefCounted<Dispatcher>,
+class Dispatcher : private fbl::RefCountedUpgradeable<Dispatcher>,
                    private fbl::Recyclable<Dispatcher> {
 public:
-    using fbl::RefCounted<Dispatcher>::AddRef;
-    using fbl::RefCounted<Dispatcher>::Release;
-    using fbl::RefCounted<Dispatcher>::Adopt;
-    using fbl::RefCounted<Dispatcher>::AddRefMaybeInDestructor;
+    using fbl::RefCountedUpgradeable<Dispatcher>::AddRef;
+    using fbl::RefCountedUpgradeable<Dispatcher>::Release;
+    using fbl::RefCountedUpgradeable<Dispatcher>::Adopt;
+    using fbl::RefCountedUpgradeable<Dispatcher>::AddRefMaybeInDestructor;
 
     // At construction, the object's state tracker is asserting
     // |signals|.
@@ -101,19 +101,19 @@ public:
     zx_koid_t get_koid() const { return koid_; }
 
     // Must be called under the handle table lock.
-    void increment_handle_count() {
+    void increment_handle_count() TA_REQ(Handle::ArenaLock::Get()) {
         ++handle_count_;
     }
 
     // Must be called under the handle table lock.
     // Returns true exactly when the handle count goes to zero.
-    bool decrement_handle_count() {
+    bool decrement_handle_count() TA_REQ(Handle::ArenaLock::Get()) {
         --handle_count_;
         return handle_count_ == 0u;
     }
 
     // Must be called under the handle table lock.
-    uint32_t current_handle_count() const {
+    uint32_t current_handle_count() const TA_REQ(Handle::ArenaLock::Get()) {
         return handle_count_;
     }
 
@@ -178,6 +178,11 @@ public:
         }
     };
 
+    // Called whenever the object is bound to a new process. The |new_owner| is
+    // the koid of the new process. It is only overriden for objects where a single
+    // owner makes sense.
+    virtual void set_owner(zx_koid_t new_owner) {}
+
 protected:
     // Notify others of a change in state (possibly waking them). (Clearing satisfied signals or
     // setting satisfiable signals should not wake anyone.)
@@ -211,7 +216,7 @@ private:
                               zx_signals_t signals) TA_REQ(get_lock());
 
     const zx_koid_t koid_;
-    uint32_t handle_count_;
+    uint32_t handle_count_ TA_GUARDED(Handle::ArenaLock::Get());
 
     zx_signals_t signals_ TA_GUARDED(get_lock());
 

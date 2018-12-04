@@ -39,15 +39,16 @@ namespace devmgr {
 
 #define TRACE_ADD_REMOVE 0
 
-bool __dm_locked = false;
-mtx_t __devhost_api_lock = MTX_INIT;
+namespace internal {
+mtx_t devhost_api_lock = MTX_INIT;
+} // namespace internal
 
-static thread_local creation_context_t* creation_ctx;
+static thread_local CreationContext* creation_ctx;
 
 // The creation context is setup before the bind() or create() ops are
 // invoked to provide the ability to sanity check the required device_add()
 // operations these hooks should be making.
-void devhost_set_creation_context(creation_context_t* ctx) {
+void devhost_set_creation_context(CreationContext* ctx) {
     creation_ctx = ctx;
 }
 
@@ -191,7 +192,6 @@ void devhost_device_destroy(zx_device_t* dev) REQ_DM_LOCK {
     // ensure all handles are invalid
     dev->event = 0xffffffff;
     dev->local_event = 0xffffffff;
-    dev->rpc = 0xFFFFFFFF;
 
     // ensure all pointers are invalid
     dev->ctx = 0;
@@ -440,7 +440,7 @@ zx_status_t devhost_device_add(zx_device_t* dev, zx_device_t* parent,
         return fail(ZX_ERR_BAD_STATE);
     }
 
-    creation_context_t* ctx = nullptr;
+    CreationContext* ctx = nullptr;
 
     // if creation ctx (thread local) is set, we are in a thread
     // that is handling a bind() or create() callback and if that
@@ -484,7 +484,7 @@ zx_status_t devhost_device_add(zx_device_t* dev, zx_device_t* parent,
         }
         dev->flags |= DEV_FLAG_ADDED;
         dev->flags &= (~DEV_FLAG_BUSY);
-        dev->rpc = ctx->rpc;
+        dev->rpc.reset(ctx->rpc);
         ctx->child = dev;
         return ZX_OK;
     }

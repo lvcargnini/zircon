@@ -82,7 +82,7 @@ public:
 
     constexpr optional()
         : has_value_(false) {}
-    explicit constexpr optional(nullopt_t)
+    constexpr optional(nullopt_t)
         : has_value_(false) {}
 
     explicit constexpr optional(T value)
@@ -226,6 +226,14 @@ public:
             other.value_.~T();
             other.has_value_ = false;
         }
+    }
+
+    template <typename... Args>
+    T& emplace(Args&&... args) {
+        reset();
+        new (&value_) T(std::forward<Args...>(args)...);
+        has_value_ = true;
+        return value_;
     }
 
 private:

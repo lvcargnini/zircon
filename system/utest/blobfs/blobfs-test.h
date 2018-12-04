@@ -40,10 +40,10 @@ public:
     bool Remount();
 
     // Forcibly unmounts and remounts the blobfs partition, regardless of the current test state.
-    // This should *not* be used within any of the test functions, but only by external forces in
-    // verifying disk integrity even in the event of a failed test. If the partition is
-    // successfully remounted, the test is restored to a kRunning state.
-    bool ForceRemount();
+    // If the partition is successfully remounted, the test is restored to a kRunning state.
+    // If |fsck_result| is not nullptr, fsck is run before remount and |fsck_result| is set to
+    // the result.
+    bool ForceRemount(zx_status_t* fsck_result = nullptr);
 
     // Unmounts a blobfs, runs fsck, and removes the backing ramdisk device.
     // If the state_ is not kRunning, the umount and fsck methods will be skipped.
@@ -98,15 +98,19 @@ public:
         END_HELPER;
     }
 
+    // Forcibly resets a running test by destroying and recreating the Blobfs partition.
+    bool ForceReset();
+
     // Sleeps or wakes the ramdisk underlying the blobfs partition, depending on its current state.
     bool ToggleSleep(uint64_t blk_count = 0);
 
     // Returns the current total transaction block count from the underlying ramdisk.
     bool GetRamdiskCount(uint64_t* blk_count) const;
-private:
-    // Checks info of mounted blobfs.
-    bool CheckInfo(const char* mount_path);
 
+    // Checks info of mounted blobfs. Returns total number of bytes available as |total_bytes|.
+    bool CheckInfo(uint64_t* total_bytes = nullptr);
+
+private:
     // Mounts the blobfs partition.
     bool Mount();
 

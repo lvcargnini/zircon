@@ -8,13 +8,18 @@ MODULE := $(LOCAL_DIR)
 
 MODULE_TYPE := driver
 
-MODULE_SRCS += $(LOCAL_DIR)/usb-tester.c
+MODULE_SRCS += \
+    $(LOCAL_DIR)/bind.c \
+    $(LOCAL_DIR)/usb-tester.cpp \
 
 MODULE_STATIC_LIBS := \
     system/ulib/ddk \
+    system/ulib/ddktl \
+    system/ulib/fbl \
     system/ulib/fidl \
     system/ulib/sync \
     system/dev/lib/usb \
+    system/ulib/zxcpp \
 
 MODULE_FIDL_LIBS := system/fidl/zircon-usb-tester
 

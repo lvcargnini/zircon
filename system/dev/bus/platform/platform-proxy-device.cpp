@@ -394,6 +394,17 @@ zx_status_t ProxyDevice::PDevGetBti(uint32_t index, zx_handle_t* out_handle) {
                        out_handle, 1, nullptr);
 }
 
+zx_status_t ProxyDevice::PDevGetSmc(uint32_t index, zx_handle_t* out_handle) {
+    rpc_pdev_req_t req = {};
+    rpc_pdev_rsp_t resp = {};
+    req.header.proto_id = ZX_PROTOCOL_PDEV;
+    req.header.op = PDEV_GET_SMC;
+    req.index = index;
+
+    return proxy_->Rpc(device_id_, &req.header, sizeof(req), &resp.header, sizeof(resp), nullptr, 0,
+                       out_handle, 1, nullptr);
+}
+
 zx_status_t ProxyDevice::PDevGetDeviceInfo(pdev_device_info_t* out_info) {
     rpc_pdev_req_t req = {};
     rpc_pdev_rsp_t resp = {};
@@ -435,7 +446,7 @@ zx_status_t ProxyDevice::PDevDeviceAdd(uint32_t index, const device_add_args_t* 
         return status;
     }
 
-    return CreateChild(zxdev(), resp.device_id, proxy_, args);
+    return CreateChild(zxdev(), resp.device_id, proxy_, args, device);
 }
 
 zx_status_t ProxyDevice::PDevGetProtocol(uint32_t proto_id, uint32_t index, void* out_protocol,
@@ -491,13 +502,14 @@ zx_status_t ProxyDevice::CreateRoot(zx_device_t* parent, fbl::RefPtr<PlatformPro
 
 zx_status_t ProxyDevice::CreateChild(zx_device_t* parent, uint32_t device_id,
                                      fbl::RefPtr<PlatformProxy> proxy,
-                                     const device_add_args_t* args) {
+                                     const device_add_args_t* args,
+                                     zx_device_t** device) {
     fbl::AllocChecker ac;
     fbl::unique_ptr<ProxyDevice> dev(new (&ac) platform_bus::ProxyDevice(parent, device_id, proxy));
     if (!ac.check()) {
         return ZX_ERR_NO_MEMORY;
     }
-    auto status = dev->InitChild(args);
+    auto status = dev->InitChild(args, device);
     if (status != ZX_OK) {
         return status;
     }
@@ -628,7 +640,7 @@ zx_status_t ProxyDevice::InitRoot() {
     return DdkAdd(name_);
 }
 
-zx_status_t ProxyDevice::InitChild(const device_add_args_t* args) {
+zx_status_t ProxyDevice::InitChild(const device_add_args_t* args, zx_device_t** device) {
     auto status = InitCommon();
     if (status != ZX_OK) {
         return status;
@@ -644,15 +656,21 @@ zx_status_t ProxyDevice::InitChild(const device_add_args_t* args) {
     new_args.ctx = this;
     new_args.ops = &ddk_device_proto_;
 
+    if (!device) {
+        device = &zxdev_;
+    }
     if (metadata_count_ == 0) {
-        return device_add(parent(), &new_args, &zxdev_);
+        auto status = device_add(parent(), &new_args, device);
+        if (status == ZX_OK) zxdev_ = *device;
+        return status;
     }
 
     new_args.flags |= DEVICE_ADD_INVISIBLE;
-    status = device_add(parent(), &new_args, &zxdev_);
+    status = device_add(parent(), &new_args, device);
     if (status != ZX_OK) {
         return status;
     }
+    zxdev_ = *device;
     // Remove ourselves from the devmgr if something goes wrong.
     auto cleanup = fbl::MakeAutoCall([this]() { DdkRemove(); });
 

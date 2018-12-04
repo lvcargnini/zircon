@@ -234,6 +234,39 @@ protected:
     static constexpr size_t kClientAppParamIndex = 1;
 };
 
+// CloseSessionMessage
+//
+// This OP-TEE message is used to close an existing open session.
+class CloseSessionMessage : public Message {
+public:
+    explicit CloseSessionMessage(SharedMemoryManager::DriverMemoryPool* message_pool,
+                                 uint32_t session_id);
+
+    // Outputs
+    uint32_t return_code() const { return header()->return_code; }
+    uint32_t return_origin() const { return header()->return_origin; }
+
+protected:
+    using Message::header; // make header() protected
+
+    static constexpr size_t kNumParams = 0;
+};
+
+// InvokeCommandMessage
+//
+// This OP-TEE message is used to invoke a command on a session between client app and trusted app.
+class InvokeCommandMessage : public Message {
+public:
+    explicit InvokeCommandMessage(SharedMemoryManager::DriverMemoryPool* message_pool,
+                                  uint32_t session_id,
+                                  uint32_t command_id,
+                                  const zircon_tee_ParameterSet& parameter_set);
+
+    // Outputs
+    uint32_t return_code() const { return header()->return_code; }
+    uint32_t return_origin() const { return header()->return_origin; }
+};
+
 // RpcMessage
 //
 // A message originating from the trusted world (TEE) specifying the details of a RPC request.

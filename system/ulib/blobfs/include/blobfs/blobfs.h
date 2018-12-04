@@ -33,7 +33,8 @@
 #include <fs/vnode.h>
 #include <fuchsia/io/c/fidl.h>
 #include <lib/async/cpp/wait.h>
-#include <lib/fzl/mapped-vmo.h>
+#include <lib/fzl/owned-vmo-mapper.h>
+#include <lib/fzl/resizeable-vmo-mapper.h>
 #include <lib/zx/event.h>
 #include <lib/zx/vmo.h>
 #include <trace/event.h>
@@ -42,13 +43,16 @@
 #include <blobfs/format.h>
 #include <blobfs/lz4.h>
 #include <blobfs/metrics.h>
+#include <blobfs/journal.h>
 #include <blobfs/writeback.h>
 
 namespace blobfs {
 
 class Blobfs;
 class Compressor;
+class Journal;
 class VnodeBlob;
+class WritebackQueue;
 class WritebackWork;
 
 using digest::Digest;
@@ -73,6 +77,11 @@ constexpr BlobFlags kBlobStateMask        = 0x000000FF;
 constexpr BlobFlags kBlobFlagDeletable    = 0x00000100; // This node should be unlinked when closed
 constexpr BlobFlags kBlobFlagDirectory    = 0x00000200; // This node represents the root directory
 constexpr BlobFlags kBlobOtherMask        = 0x0000FF00;
+
+enum class EnqueueType {
+    kJournal,
+    kData,
+};
 
 // clang-format on
 
@@ -168,17 +177,19 @@ private:
     void HandleNoClones(async_dispatcher_t* dispatcher, async::WaitBase* wait,
                         zx_status_t status, const zx_packet_signal_t* signal);
 
-    void QueueUnlink();
+    zx_status_t QueueUnlink();
 
-    void TryPurge() {
+    zx_status_t TryPurge() {
         if (Purgeable()) {
-            Purge();
+            return Purge();
         }
+
+        return ZX_OK;
     }
 
     // Verify that the blob is purgeable and remove all traces of the blob from blobfs.
     // The blob is not expected to be accessed again after this is called.
-    void Purge();
+    zx_status_t Purge();
 
     // If successful, allocates Blob Node and Blocks (in-memory)
     // kBlobStateEmpty --> kBlobStateDataWrite
@@ -242,9 +253,9 @@ private:
     // InitVmos() must have already been called for this blob.
     zx_status_t Verify() const;
 
-    // Called by Blob once the last write has completed, updating the
+    // Called by the Vnode once the last write has completed, updating the
     // on-disk metadata.
-    zx_status_t WriteMetadata(fbl::unique_ptr<WritebackWork> wb);
+    zx_status_t WriteMetadata();
 
     // Acquire a pointer to the mapped data or merkle tree
     void* GetData() const;
@@ -256,13 +267,13 @@ private:
     BlobFlags flags_ = {};
     fbl::atomic_bool syncing_;
 
-    // The blob_ here consists of:
+    // The mapping here consists of:
     // 1) The Merkle Tree
     // 2) The Blob itself, aligned to the nearest kBlobfsBlockSize
-    fbl::unique_ptr<fzl::MappedVmo> blob_ = {};
+    fzl::OwnedVmoMapper mapping_;
     vmoid_t vmoid_ = {};
 
-    // Watches any clones of "blob_" provided to clients.
+    // Watches any clones of "vmo_" provided to clients.
     // Observes the ZX_VMO_ZERO_CHILDREN signal.
     async::WaitMethod<VnodeBlob, &VnodeBlob::HandleNoClones> clone_watcher_;
     // Keeps a reference to the blob alive (from within itself)
@@ -283,7 +294,7 @@ private:
     struct WritebackInfo {
         uint64_t bytes_written = {};
         Compressor compressor;
-        fbl::unique_ptr<fzl::MappedVmo> compressed_blob = {};
+        fzl::OwnedVmoMapper compressed_blob;
     };
 
     fbl::unique_ptr<WritebackInfo> write_info_ = {};
@@ -325,6 +336,7 @@ enum class CachePolicy {
 struct MountOptions {
     bool readonly = false;
     bool metrics = false;
+    bool journal = false;
     CachePolicy cache_policy = CachePolicy::EvictImmediately;
 };
 
@@ -381,10 +393,12 @@ public:
         on_unmount_ = fbl::move(closure);
     }
 
-    // Initializes the WritebackBuffer.
-    zx_status_t InitializeWriteback();
-    // Returns the capacity of the writeback buffer, in blocks.
-    size_t WritebackCapacity() const { return writeback_->Capacity(); }
+    // Initializes the WritebackQueue and Journal (if enabled in |options|),
+    // replaying any existing journal entries.
+    zx_status_t InitializeWriteback(const MountOptions& options);
+
+    // Returns the capacity of the writeback buffer in blocks.
+    size_t WritebackCapacity() const;
 
     virtual ~Blobfs();
 
@@ -430,6 +444,8 @@ public:
         return blockfd_.get();
     }
 
+    const Superblock& Info() const { return info_; }
+
     // Returns an unique identifier for this instance.
     uint64_t GetFsId() const { return fs_id_; }
 
@@ -469,17 +485,13 @@ public:
     void UpdateMerkleVerifyMetrics(uint64_t size_data, uint64_t size_merkle,
                                    const fs::Duration& duration);
 
-    Superblock info_;
+    zx_status_t CreateWork(fbl::unique_ptr<WritebackWork>* out, VnodeBlob* vnode);
 
-    zx_status_t CreateWork(fbl::unique_ptr<WritebackWork>* out, VnodeBlob* vnode) {
-        ZX_DEBUG_ASSERT(writeback_ != nullptr);
-        return writeback_->GenerateWork(out, fbl::move(fbl::WrapRefPtr(vnode)));
-    }
-
-    void EnqueueWork(fbl::unique_ptr<WritebackWork> work) {
-        ZX_DEBUG_ASSERT(writeback_ != nullptr);
-        writeback_->Enqueue(fbl::move(work));
-    }
+    // Enqueues |work| to the appropriate buffer. If |journal| is true and the journal is enabled,
+    // the transaction(s) will first be written to the journal. Otherwise, they will be sent
+    // straight to the writeback buffer.
+    zx_status_t EnqueueWork(fbl::unique_ptr<WritebackWork> work, EnqueueType type)
+        __WARN_UNUSED_RESULT;
 
     // Does a single pass of all blobs, creating uninitialized Vnode
     // objects for them all.
@@ -508,7 +520,10 @@ private:
 
     Blobfs(fbl::unique_fd fd, const Superblock* info);
     zx_status_t LoadBitmaps();
-    fbl::unique_ptr<WritebackBuffer> writeback_;
+
+    // Reloads metadata from disk. Useful when metadata on disk
+    // may have changed due to journal playback.
+    zx_status_t Reload();
 
     // Inserts a Vnode into the |closed_hash_|, tears down
     // cache Vnode state, and leaks a reference to the Vnode
@@ -533,6 +548,9 @@ private:
 
     // Reserves space for a block in memory. Does not update disk.
     zx_status_t ReserveBlocks(size_t nblocks, size_t* blkno_out);
+
+    // Log information about blobfs' allocation when we run out of space.
+    void LogAllocationFailure(size_t num_blocks) const;
 
     // Unreserves space for blocks in memory. Does not update disk.
     void UnreserveBlocks(size_t nblocks, size_t blkno_start);
@@ -589,6 +607,10 @@ private:
                                            VnodeBlob*,
                                            MerkleRootTraits,
                                            VnodeBlob::TypeWavlTraits>;
+    fbl::unique_ptr<WritebackQueue> writeback_;
+    fbl::unique_ptr<Journal> journal_;
+    Superblock info_;
+
     fbl::Mutex hash_lock_;
     WAVLTreeByMerkle open_hash_ __TA_GUARDED(hash_lock_){};   // All 'in use' blobs.
     WAVLTreeByMerkle closed_hash_ __TA_GUARDED(hash_lock_){}; // All 'closed' blobs.
@@ -600,9 +622,9 @@ private:
 
     RawBitmap block_map_ = {};
     vmoid_t block_map_vmoid_ = {};
-    fbl::unique_ptr<fzl::MappedVmo> node_map_ = {};
+    fzl::ResizeableVmoMapper node_map_;
     vmoid_t node_map_vmoid_ = {};
-    fbl::unique_ptr<fzl::MappedVmo> info_vmo_ = {};
+    fzl::ResizeableVmoMapper info_mapping_;
     vmoid_t info_vmoid_ = {};
 
     // The reserved_blocks_ and reserved_nodes_ bitmaps only hold in-flight reservations.

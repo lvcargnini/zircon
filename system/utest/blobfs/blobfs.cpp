@@ -48,14 +48,17 @@ using digest::Digest;
 using digest::MerkleTree;
 
 // Indicates whether we should enable ramdisk failure tests for the current test run.
-static bool gEnableRamdiskFailure = false;
+bool gEnableRamdiskFailure = false;
 
 // The maximum number of failure loops that should be tested. If set to 0, all of them will be run.
-static uint64_t gRamdiskFailureLoops = 0;
+uint64_t gRamdiskFailureLoops = 0;
+
+// Indicates whether we should enable the journal for the current test run.
+bool gEnableJournal = true;
 
 // Information about the real disk which must be constructed at runtime, but which persists
 // between tests.
-static bool gUseRealDisk = false;
+bool gUseRealDisk = false;
 struct real_disk_info {
     uint64_t blk_size;
     uint64_t blk_count;
@@ -138,9 +141,11 @@ bool TestWrapper(void) {
             break;
         }
 
-        printf("Running ramdisk failure test %" PRIu64 " / %" PRIu64
-               " (block %" PRIu64 " / %" PRIu64 ")\n", total,
-               gRamdiskFailureLoops ? gRamdiskFailureLoops : block_count, i, block_count);
+        if (total % 100 == 0) {
+            printf("Running ramdisk failure test %" PRIu64 " / %" PRIu64
+                   " (block %" PRIu64 " / %" PRIu64 ")\n", total+1,
+                   gRamdiskFailureLoops ? gRamdiskFailureLoops : block_count, i, block_count);
+        }
 
         ASSERT_TRUE(blobfsTest.Reset());
         ASSERT_TRUE(blobfsTest.Init(), "Mounting Blobfs");
@@ -161,11 +166,17 @@ bool TestWrapper(void) {
 
         // Forcibly unmount and remount the blobfs partition. With journaling enabled, any
         // inconsistencies should be resolved.
-        ASSERT_TRUE(blobfsTest.ForceRemount());
+        zx_status_t fsck_result;
+        ASSERT_TRUE(blobfsTest.ForceRemount(&fsck_result));
+
+        if (fsck_result != ZX_OK) {
+            printf("Detected disk corruption on test %" PRIu64 " / %" PRIu64
+                   " (block %" PRIu64 " / %" PRIu64 ")\n", total,
+                   gRamdiskFailureLoops ? gRamdiskFailureLoops : block_count, i, block_count);
+        }
 
         // The fsck check during Teardown should verify that journal replay was successful.
         ASSERT_TRUE(blobfsTest.Teardown(), "Unmounting Blobfs");
-
         total += 1;
     }
 
@@ -286,18 +297,25 @@ bool BlobfsTest::Remount() {
     ASSERT_EQ(state_, FsTestState::kRunning);
     auto error = fbl::MakeAutoCall([this](){ state_ = FsTestState::kError; });
     ASSERT_EQ(umount(MOUNT_PATH), ZX_OK, "Failed to unmount blobfs");
-    ASSERT_EQ(fsck(ramdisk_path_, DISK_FORMAT_BLOBFS, &test_fsck_options,
-                   launch_stdio_sync), ZX_OK, "Filesystem fsck failed");
+    LaunchCallback launch = stdio_ ? launch_stdio_sync : launch_silent_sync;
+    ASSERT_EQ(fsck(ramdisk_path_, DISK_FORMAT_BLOBFS, &test_fsck_options, launch), ZX_OK,
+              "Filesystem fsck failed");
     ASSERT_TRUE(Mount(), "Failed to mount blobfs");
     error.cancel();
     END_HELPER;
 }
 
-bool BlobfsTest::ForceRemount() {
+bool BlobfsTest::ForceRemount(zx_status_t* fsck_result) {
     BEGIN_HELPER;
     // Attempt to unmount, but do not check the result.
     // It is possible that the partition has already been unmounted.
     umount(MOUNT_PATH);
+
+    if (fsck_result != nullptr) {
+        *fsck_result = fsck(ramdisk_path_, DISK_FORMAT_BLOBFS, &test_fsck_options,
+                            launch_silent_sync);
+    }
+
     ASSERT_TRUE(Mount());
     // In the event of success, set state to kRunning, regardless of whether the state was kMinimal
     // before. Since the partition is now mounted, we will need to umount/fsck on Teardown.
@@ -312,7 +330,7 @@ bool BlobfsTest::Teardown() {
 
     if (state_ == FsTestState::kRunning) {
         ASSERT_EQ(state_, FsTestState::kRunning);
-        ASSERT_TRUE(CheckInfo(MOUNT_PATH));
+        ASSERT_TRUE(CheckInfo());
         ASSERT_EQ(umount(MOUNT_PATH), ZX_OK, "Failed to unmount filesystem");
         ASSERT_EQ(fsck(ramdisk_path_, DISK_FORMAT_BLOBFS, &test_fsck_options, launch_stdio_sync),
                   ZX_OK, "Filesystem fsck failed");
@@ -368,23 +386,50 @@ bool BlobfsTest::GetDevicePath(char* path, size_t len) const {
     END_HELPER;
 }
 
+bool BlobfsTest::ForceReset() {
+    BEGIN_HELPER;
+    if (state_ == FsTestState::kComplete) {
+        return Reset();
+    }
+
+    ASSERT_NE(state_, FsTestState::kInit);
+    ASSERT_EQ(umount(MOUNT_PATH), ZX_OK, "Failed to unmount filesystem");
+
+    if (gUseRealDisk) {
+        if (type_ == FsTestType::kFvm) {
+            ASSERT_EQ(fvm_destroy(fvm_path_), ZX_OK);
+        }
+    } else {
+        if (type_ == FsTestType::kFvm) {
+            ASSERT_EQ(destroy_ramdisk(fvm_path_), 0);
+        } else {
+            ASSERT_EQ(destroy_ramdisk(ramdisk_path_), 0);
+        }
+    }
+
+    FsTestState old_state = state_;
+    state_ = FsTestState::kInit;
+
+    ASSERT_TRUE(Init(old_state));
+    END_HELPER;
+}
+
 bool BlobfsTest::ToggleSleep(uint64_t blk_count) {
     BEGIN_HELPER;
 
+    char* ramdisk_path;
+    if (type_ == FsTestType::kNormal) {
+        ramdisk_path = ramdisk_path_;
+    } else {
+        ramdisk_path = fvm_path_;
+    }
+
     if (asleep_) {
         // If the ramdisk is asleep, wake it up.
-        if (type_ == FsTestType::kNormal) {
-            ASSERT_EQ(wake_ramdisk(ramdisk_path_), ZX_OK);
-        } else {
-            ASSERT_EQ(wake_ramdisk(fvm_path_), ZX_OK);
-        }
+        ASSERT_EQ(wake_ramdisk(ramdisk_path), ZX_OK);
     } else {
         // If the ramdisk is active, put it to sleep after the specified block count.
-        if (type_ == FsTestType::kNormal) {
-            ASSERT_EQ(sleep_ramdisk(ramdisk_path_, blk_count), ZX_OK);
-        } else {
-            ASSERT_EQ(sleep_ramdisk(fvm_path_, blk_count), ZX_OK);
-        }
+        ASSERT_EQ(sleep_ramdisk(ramdisk_path, blk_count), ZX_OK);
     }
 
     asleep_ = !asleep_;
@@ -410,8 +455,8 @@ bool BlobfsTest::GetRamdiskCount(uint64_t* blk_count) const {
     END_HELPER;
 }
 
-bool BlobfsTest::CheckInfo(const char* mount_path) {
-    fbl::unique_fd fd(open(mount_path, O_RDONLY | O_DIRECTORY));
+bool BlobfsTest::CheckInfo(uint64_t* total_bytes) {
+    fbl::unique_fd fd(open(MOUNT_PATH, O_RDONLY | O_DIRECTORY));
     ASSERT_TRUE(fd);
 
     zx_status_t status;
@@ -426,6 +471,11 @@ bool BlobfsTest::CheckInfo(const char* mount_path) {
     ASSERT_LE(info.used_nodes, info.total_nodes, "Used nodes greater than free nodes");
     ASSERT_LE(info.used_bytes, info.total_bytes, "Used bytes greater than free bytes");
     ASSERT_EQ(close(caller.release().release()), 0);
+
+    if (total_bytes != nullptr) {
+        *total_bytes = info.total_bytes;
+    }
+
     return true;
 }
 
@@ -436,20 +486,19 @@ bool BlobfsTest::Mount() {
     fbl::unique_fd fd(open(ramdisk_path_, flags));
     ASSERT_TRUE(fd.get(), "Could not open ramdisk");
 
-    mount_options_t options;
-    memcpy(&options, &default_mount_options, sizeof(options));
+    mount_options_t options = default_mount_options;
+    options.enable_journal = gEnableJournal;
 
     if (read_only_) {
         options.readonly = true;
     }
 
-    auto launch = stdio_ ? launch_stdio_async : launch_silent_async;
+    LaunchCallback launch = stdio_ ? launch_stdio_async : launch_silent_async;
 
     // fd consumed by mount. By default, mount waits until the filesystem is
     // ready to accept commands.
     ASSERT_EQ(mount(fd.get(), MOUNT_PATH, DISK_FORMAT_BLOBFS, &options, launch), ZX_OK,
               "Could not mount blobfs");
-
     END_HELPER;
 }
 
@@ -473,11 +522,19 @@ static int StreamAll(T func, int fd, U* buf, size_t max) {
 static bool VerifyContents(int fd, const char* data, size_t size_data) {
     // Verify the contents of the Blob
     fbl::AllocChecker ac;
-    fbl::unique_ptr<char[]> buf(new (&ac) char[size_data]);
+    constexpr size_t kReadSize = 8192;
+    fbl::unique_ptr<char[]> buffer(new (&ac) char[kReadSize]);
     EXPECT_EQ(ac.check(), true);
     ASSERT_EQ(lseek(fd, 0, SEEK_SET), 0);
-    ASSERT_EQ(StreamAll(read, fd, &buf[0], size_data), 0, "Failed to read data");
-    ASSERT_EQ(memcmp(buf.get(), data, size_data), 0, "Read data, but it was bad");
+
+    size_t total_read = 0;
+    while (total_read != size_data) {
+        ssize_t result = read(fd, buffer.get(), kReadSize);
+        ASSERT_GT(result, 0);
+        ASSERT_EQ(memcmp(buffer.get(), &data[total_read], result), 0);
+        total_read += result;
+    }
+
     return true;
 }
 
@@ -639,7 +696,7 @@ bool QueryInfo(size_t expected_nodes, size_t expected_bytes) {
 // Actual tests:
 static bool TestBasic(BlobfsTest* blobfsTest) {
     BEGIN_HELPER;
-    for (size_t i = 10; i < 16; i++) {
+    for (unsigned int i = 10; i < 16; i++) {
         fbl::unique_ptr<blob_info_t> info;
         ASSERT_TRUE(GenerateRandomBlob(1 << i, &info));
 
@@ -878,8 +935,12 @@ static bool TestDiskTooSmall(BlobfsTest* blobfsTest) {
         // Calculate slices required for data blocks based on minimum requirement and slice size.
         uint64_t required_data_slices = fbl::round_up(blobfs::kMinimumDataBlocks, blocks_per_slice)
                                         / blocks_per_slice;
+        uint64_t required_journal_slices = fbl::round_up(blobfs::kDefaultJournalBlocks,
+                                                         blocks_per_slice) / blocks_per_slice;
+
         // Require an additional 1 slice each for super, inode, and block bitmaps.
-        uint64_t blobfs_size = (required_data_slices + 3) * kTestFvmSliceSize;
+        uint64_t blobfs_size = (required_journal_slices + required_data_slices + 3)
+                               * kTestFvmSliceSize;
         minimum_size = blobfs_size;
         uint64_t metadata_size = fvm::MetadataSize(blobfs_size, kTestFvmSliceSize);
 
@@ -894,11 +955,11 @@ static bool TestDiskTooSmall(BlobfsTest* blobfsTest) {
     } else {
         blobfs::Superblock info;
         info.inode_count = blobfs::kBlobfsDefaultInodeCount;
-        info.block_count = blobfs::kMinimumDataBlocks;
+        info.data_block_count = blobfs::kMinimumDataBlocks;
+        info.journal_block_count = blobfs::kMinimumJournalBlocks;
         info.flags = 0;
 
-        minimum_size = (blobfs::DataBlocks(info) + blobfs::DataStartBlock(info)) *
-                       blobfs::kBlobfsBlockSize;
+        minimum_size = blobfs::TotalBlocks(info) * blobfs::kBlobfsBlockSize;
     }
 
     // Teardown the initial test configuration and reset the test state.
@@ -2114,7 +2175,6 @@ static bool ResizePartition(BlobfsTest* blobfsTest) {
         ASSERT_EQ(close(fd.release()), 0);
     }
 
-    printf("Remounting blobfs\n");
     // Remount partition
     ASSERT_TRUE(blobfsTest->Remount(), "Could not re-mount blobfs");
 
@@ -2172,10 +2232,12 @@ static bool CorruptAtMount(BlobfsTest* blobfsTest) {
     ASSERT_EQ(query_request.count, query_response.count);
     ASSERT_FALSE(query_response.vslice_range[0].allocated);
     ASSERT_EQ(query_response.vslice_range[0].count,
-              (blobfs::kFVMDataStart - blobfs::kFVMNodeMapStart) / kBlocksPerSlice);
+              (blobfs::kFVMJournalStart - blobfs::kFVMNodeMapStart) / kBlocksPerSlice);
 
     // Attempt to mount the VPart. This should fail since slices are missing.
-    ASSERT_NE(mount(fd.release(), MOUNT_PATH, DISK_FORMAT_BLOBFS, &default_mount_options,
+    mount_options_t options = default_mount_options;
+    options.enable_journal = gEnableJournal;
+    ASSERT_NE(mount(fd.release(), MOUNT_PATH, DISK_FORMAT_BLOBFS, &options,
                     launch_stdio_async), ZX_OK);
 
     fd.reset(blobfsTest->GetFd());
@@ -2193,7 +2255,7 @@ static bool CorruptAtMount(BlobfsTest* blobfsTest) {
     ASSERT_EQ(query_response.vslice_range[0].count, 2);
 
     // Attempt to mount the VPart. This should succeed.
-    ASSERT_EQ(mount(fd.release(), MOUNT_PATH, DISK_FORMAT_BLOBFS, &default_mount_options,
+    ASSERT_EQ(mount(fd.release(), MOUNT_PATH, DISK_FORMAT_BLOBFS, &options,
                     launch_stdio_async), ZX_OK);
 
     ASSERT_EQ(umount(MOUNT_PATH), ZX_OK);
@@ -2206,7 +2268,6 @@ static bool CorruptAtMount(BlobfsTest* blobfsTest) {
     ASSERT_EQ(query_request.count, query_response.count);
     ASSERT_TRUE(query_response.vslice_range[0].allocated);
     ASSERT_EQ(query_response.vslice_range[0].count, 1);
-
     END_HELPER;
 }
 
@@ -2306,6 +2367,237 @@ static bool TestCompressorBufferTooSmall(void) {
     END_TEST;
 }
 
+static bool TestCreateFailure(void) {
+    BEGIN_TEST;
+    BlobfsTest blobfsTest(FsTestType::kNormal);
+    blobfsTest.SetStdio(false);
+    ASSERT_TRUE(blobfsTest.Init(), "Mounting Blobfs");
+
+    fbl::unique_ptr<blob_info_t> info;
+    ASSERT_TRUE(GenerateRandomBlob(blobfs::kBlobfsBlockSize, &info));
+
+    size_t blocks = 0;
+
+    // Attempt to create a blob, failing after each written block until the operations succeeds.
+    // After each failure, check for disk consistency.
+    while (true) {
+        ASSERT_TRUE(blobfsTest.ToggleSleep(blocks));
+        unittest_set_output_function(silent_printf, nullptr);
+        fbl::unique_fd fd;
+
+        // Blob creation may or may not succeed - as long as fsck passes, it doesn't matter.
+        MakeBlob(info.get(), &fd);
+        current_test_info->all_ok = true;
+
+        // Resolve all transactions before waking the ramdisk.
+        syncfs(fd.get());
+        unittest_restore_output_function();
+        ASSERT_TRUE(blobfsTest.ToggleSleep());
+
+        // Force remount so journal will replay.
+        ASSERT_TRUE(blobfsTest.ForceRemount());
+
+        // Remount again to check fsck results.
+        ASSERT_TRUE(blobfsTest.Remount());
+
+        // Once file creation is successful, break out of the loop.
+        fd.reset(open(info->path, O_RDONLY));
+        if (fd) break;
+
+        blocks++;
+    }
+
+    ASSERT_TRUE(blobfsTest.Teardown(), "Unmounting Blobfs");
+    END_TEST;
+}
+
+static bool TestExtendFailure(void) {
+    BEGIN_TEST;
+    BlobfsTest blobfsTest(FsTestType::kFvm);
+    blobfsTest.SetStdio(false);
+    ASSERT_TRUE(blobfsTest.Init(), "Mounting Blobfs");
+
+    uint64_t original_bytes;
+    blobfsTest.CheckInfo(&original_bytes);
+
+    // Create a blob of the maximum size possible without causing an FVM extension.
+    fbl::unique_ptr<blob_info_t> info;
+    ASSERT_TRUE(GenerateRandomBlob(original_bytes - blobfs::kBlobfsBlockSize, &info));
+
+    fbl::unique_fd fd;
+    ASSERT_TRUE(MakeBlob(info.get(), &fd));
+    ASSERT_EQ(syncfs(fd.get()), 0);
+    ASSERT_EQ(close(fd.release()), 0);
+
+    // Ensure that an FVM extension did not occur.
+    uint64_t current_bytes;
+    blobfsTest.CheckInfo(&current_bytes);
+    ASSERT_EQ(current_bytes, original_bytes);
+
+    // Generate another blob of the smallest size possible.
+    fbl::unique_ptr<blob_info_t> new_info;
+    ASSERT_TRUE(GenerateRandomBlob(blobfs::kBlobfsBlockSize, &new_info));
+
+    // Since the FVM metadata covers a large range of blocks, it will take a while to test a
+    // ramdisk failure after each individual block. Since we mostly care about what happens with
+    // blobfs after the extension succeeds on the FVM side, test a maximum of |metadata_failures|
+    // failures within the FVM metadata write itself.
+    size_t metadata_size = fvm::MetadataSize(blobfsTest.GetDiskSize(), kTestFvmSliceSize);
+    size_t metadata_blocks = metadata_size / blobfsTest.GetBlockSize();
+    size_t metadata_failures = 16;
+    size_t increment = metadata_blocks / fbl::min(metadata_failures, metadata_blocks);
+
+    // Round down the metadata block count so we don't miss testing the transaction immediately
+    // after the metadata write succeeds.
+    metadata_blocks = fbl::round_down(metadata_blocks, increment);
+    size_t blocks = 0;
+
+    while (true) {
+        ASSERT_TRUE(blobfsTest.ToggleSleep(blocks));
+        unittest_set_output_function(silent_printf, nullptr);
+
+        // Blob creation may or may not succeed - as long as fsck passes, it doesn't matter.
+        MakeBlob(new_info.get(), &fd);
+        current_test_info->all_ok = true;
+
+        // Resolve all transactions before waking the ramdisk.
+        syncfs(fd.get());
+
+        unittest_restore_output_function();
+        ASSERT_TRUE(blobfsTest.ToggleSleep());
+
+        // Force remount so journal will replay.
+        ASSERT_TRUE(blobfsTest.ForceRemount());
+
+        // Remount again to check fsck results.
+        ASSERT_TRUE(blobfsTest.Remount());
+
+        // Check that the original blob still exists.
+        fd.reset(open(info->path, O_RDONLY));
+        ASSERT_TRUE(fd);
+
+        // Once file creation is successful, break out of the loop.
+        fd.reset(open(new_info->path, O_RDONLY));
+        if (fd) {
+            struct stat stats;
+            ASSERT_EQ(fstat(fd.get(), &stats), 0);
+            ASSERT_EQ(static_cast<uint64_t>(stats.st_size), info->size_data);
+            break;
+        }
+
+        if (blocks >= metadata_blocks) {
+            blocks++;
+        } else {
+            blocks += increment;
+        }
+    }
+
+    // Ensure that an FVM extension occurred.
+    blobfsTest.CheckInfo(&current_bytes);
+    ASSERT_GT(current_bytes, original_bytes);
+
+    ASSERT_TRUE(blobfsTest.Teardown(), "Unmounting Blobfs");
+    END_TEST;
+}
+
+static bool TestFailedWrite(BlobfsTest* blobfsTest) {
+    BEGIN_TEST;
+
+    if (gUseRealDisk) {
+        fprintf(stderr, "Ramdisk required; skipping test\n");
+        return true;
+    }
+
+    uint64_t block_size = blobfsTest->GetBlockSize();
+    ASSERT_EQ(blobfs::kBlobfsBlockSize % block_size, 0);
+    const uint64_t kDiskBlocksPerBlobfsBlock = blobfs::kBlobfsBlockSize / block_size;
+
+    fbl::unique_ptr<blob_info_t> info;
+    ASSERT_TRUE(GenerateRandomBlob(blobfs::kBlobfsBlockSize, &info));
+
+    fbl::unique_fd fd(open(info->path, O_CREAT | O_RDWR));
+    ASSERT_TRUE(fd, "Failed to create blob");
+    // Truncate before sleeping the ramdisk. This is so potential FVM updates
+    // do not interfere with the ramdisk block count.
+    ASSERT_EQ(ftruncate(fd.get(), info->size_data), 0);
+    // Sleep after |kMaxEntryDataBlocks| blocks. This is 1 less than will be needed to write out the
+    // entire blob. This ensures that writing the blob will ultimately fail, but the write
+    // operation will return a successful response.
+    ASSERT_TRUE(blobfsTest->ToggleSleep(kDiskBlocksPerBlobfsBlock * blobfs::kMaxEntryDataBlocks));
+    ASSERT_EQ(write(fd.get(), info->data.get(), info->size_data),
+              static_cast<ssize_t>(info->size_data));
+
+    // Since the write operation ultimately failed when going out to disk,
+    // syncfs will return a failed response.
+    ASSERT_LT(syncfs(fd.get()), 0);
+    ASSERT_EQ(errno, EPIPE);
+
+    ASSERT_TRUE(GenerateRandomBlob(blobfs::kBlobfsBlockSize, &info));
+    fd.reset(open(info->path, O_CREAT | O_RDWR));
+    ASSERT_TRUE(fd, "Failed to create blob");
+
+    if (blobfsTest->GetType() == FsTestType::kFvm) {
+        // On an FVM, truncate may either succeed or fail. If an FVM extend call is necessary,
+        // it will fail since the ramdisk is asleep; otherwise, it will pass.
+        ftruncate(fd.get(), info->size_data);
+    } else {
+        // Since truncate is done entirely in memory, a non-FVM truncate should always pass.
+        ASSERT_EQ(ftruncate(fd.get(), info->size_data), 0);
+    }
+
+    // Since the ramdisk is asleep and our blobfs is aware of it due to the sync, write should fail.
+    ASSERT_LT(write(fd.get(), info->data.get(), blobfs::kBlobfsBlockSize), 0);
+    ASSERT_EQ(errno, EPIPE);
+
+    // Wake the ramdisk and forcibly remount the BlobfsTest, forcing the journal to replay
+    // and restore blobfs to a consistent state.
+    ASSERT_TRUE(blobfsTest->ToggleSleep());
+    ASSERT_TRUE(blobfsTest->ForceRemount());
+
+    // Reset the ramdisk counts so we don't attempt to run ramdisk failure tests,
+    // since we are already failing the ramdisk within this test.
+    ASSERT_TRUE(blobfsTest->ToggleSleep());
+    ASSERT_TRUE(blobfsTest->ToggleSleep());
+    END_TEST;
+}
+
+static bool TestLargeBlob() {
+    BEGIN_TEST;
+
+    BlobfsTest blobfsTest(FsTestType::kNormal);
+
+    // Create blobfs with enough data blocks to ensure 2 block bitmap blocks.
+    blobfs::Superblock superblock;
+    superblock.flags = 0;
+    superblock.inode_count = blobfs::kBlobfsDefaultInodeCount;
+    superblock.journal_block_count = blobfs::kDefaultJournalBlocks;
+    superblock.data_block_count = 2 * blobfs::kBlobfsBlockBits;
+    ASSERT_EQ(superblock.data_block_count % 2, 0);
+
+    uint64_t blobfs_blocks = blobfs::TotalBlocks(superblock);
+    uint64_t ramdisk_blocks = (blobfs_blocks * blobfs::kBlobfsBlockSize)
+                              / blobfsTest.GetBlockSize();
+    blobfsTest.SetBlockCount(ramdisk_blocks);
+
+    ASSERT_TRUE(blobfsTest.Init());
+
+    // Create (and delete) a blob large enough to overflow into the second bitmap block.
+    fbl::unique_ptr<blob_info_t> info;
+    size_t blob_size = ((superblock.data_block_count / 2) + 1) * blobfs::kBlobfsBlockSize;
+    ASSERT_TRUE(GenerateRandomBlob(blob_size, &info));
+
+    fbl::unique_fd fd;
+    ASSERT_TRUE(MakeBlob(info.get(), &fd));
+    ASSERT_EQ(syncfs(fd.get()), 0);
+    ASSERT_EQ(close(fd.release()), 0);
+    ASSERT_EQ(unlink(info->path), 0);
+
+    ASSERT_TRUE(blobfsTest.Teardown());
+    END_TEST;
+}
+
+// TODO(ZX-2416): Add tests to manually corrupt journal entries/metadata.
+
 BEGIN_TEST_CASE(blobfs_tests)
 RUN_TESTS(MEDIUM, TestBasic)
 RUN_TESTS(MEDIUM, TestNullBlob)
@@ -2346,9 +2638,14 @@ RUN_TESTS(MEDIUM, TestReadOnly)
 RUN_TEST_FVM(MEDIUM, ResizePartition)
 RUN_TEST_FVM(MEDIUM, CorruptAtMount)
 RUN_TESTS(LARGE, CreateWriteReopen)
-RUN_TEST(TestCompressorBufferTooSmall);
+RUN_TEST(TestCompressorBufferTooSmall)
+RUN_TEST_MEDIUM(TestCreateFailure)
+RUN_TEST_MEDIUM(TestExtendFailure)
+RUN_TEST_LARGE(TestLargeBlob)
+RUN_TESTS(SMALL, TestFailedWrite)
 END_TEST_CASE(blobfs_tests)
 
+// TODO(planders): revamp blobfs test options.
 static void print_test_help(FILE* f) {
     fprintf(f,
             "  -d <blkdev>\n"
@@ -2361,6 +2658,8 @@ static void print_test_help(FILE* f) {
             "        remounted and checked for consistency via fsck.\n"
             "      If <count> is 0, the maximum number of tests are run.\n"
             "      This option is only valid when using a ramdisk.\n"
+            "  -j\n"
+            "      Disable the journal\n"
             "\n");
 }
 
@@ -2410,6 +2709,9 @@ int main(int argc, char** argv) {
             gEnableRamdiskFailure = true;
             gRamdiskFailureLoops = atoi(argv[i + 1]);
             i += 2;
+        } else if (!strcmp(argv[i], "-j")) {
+            gEnableJournal = false;
+            i++;
         } else {
             // Ignore options we don't recognize. See ulib/unittest/README.md.
             break;

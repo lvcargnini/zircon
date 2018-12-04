@@ -447,7 +447,8 @@ Additional errors:
 *buffer* type: **zx_info_maps_t[n]**
 
 The *zx_info_maps_t* array is a depth-first pre-order walk of the target
-process's Aspace/VMAR/Mapping tree.
+process's Aspace/VMAR/Mapping tree. As per the pre-order traversal base
+addresses will be in ascending order.
 
 ```
 typedef struct zx_info_maps {
@@ -628,6 +629,8 @@ The resource kind is one of
 *   *ZX_RSRC_KIND_IOPORT*
 *   *ZX_RSRC_KIND_IRQ*
 *   *ZX_RSRC_KIND_HYPERVISOR*
+*   *ZX_RSRC_KIND_VMEX*
+*   *ZX_RSRC_KIND_SMC*
 
 ### ZX_INFO_BTI
 

@@ -11,9 +11,10 @@ MODULE_TYPE := userlib
 MODULE_COMPILEFLAGS += -fvisibility=hidden
 
 MODULE_SRCS += \
-    $(LOCAL_DIR)/mapped-vmo.cpp \
     $(LOCAL_DIR)/memory-probe.cpp \
+    $(LOCAL_DIR)/owned-vmo-mapper.cpp \
     $(LOCAL_DIR)/pinned-vmo.cpp \
+    $(LOCAL_DIR)/resizeable-vmo-mapper.cpp \
     $(LOCAL_DIR)/time.cpp \
     $(LOCAL_DIR)/vmar-manager.cpp \
     $(LOCAL_DIR)/vmo-mapper.cpp \

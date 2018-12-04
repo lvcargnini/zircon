@@ -42,10 +42,10 @@ void VnodeBlob::fbl_recycle() {
 
 void VnodeBlob::TearDown() {
     ZX_ASSERT(clone_watcher_.object() == ZX_HANDLE_INVALID);
-    if (blob_ != nullptr) {
+    if (mapping_.vmo()) {
         blobfs_->DetachVmo(vmoid_);
     }
-    blob_ = nullptr;
+    mapping_.Reset();
 }
 
 VnodeBlob::~VnodeBlob() {
@@ -191,7 +191,7 @@ zx_status_t VnodeBlob::QueryFilesystem(fuchsia_io_FilesystemInfo* info) {
     info->max_filename_size = Digest::kLength * 2;
     info->fs_type = VFS_TYPE_BLOBFS;
     info->fs_id = blobfs_->GetFsId();
-    info->total_bytes = blobfs_->info_.block_count * blobfs_->info_.block_size;
+    info->total_bytes = blobfs_->info_.data_block_count * blobfs_->info_.block_size;
     info->used_bytes = blobfs_->info_.alloc_block_count * blobfs_->info_.block_size;
     info->total_nodes = blobfs_->info_.inode_count;
     info->used_nodes = blobfs_->info_.alloc_inode_count;
@@ -225,8 +225,7 @@ zx_status_t VnodeBlob::Unlink(fbl::StringPiece name, bool must_be_dir) {
     } else if ((status = blobfs_->LookupBlob(digest, &out)) < 0) {
         return status;
     }
-    out->QueueUnlink();
-    return ZX_OK;
+    return out->QueueUnlink();
 }
 
 zx_status_t VnodeBlob::GetVmo(int flags, zx_handle_t* out) {
@@ -292,15 +291,15 @@ zx_status_t VnodeBlob::Close() {
     ZX_DEBUG_ASSERT_MSG(fd_count_ > 0, "Closing blob with no fds open");
     fd_count_--;
     // Attempt purge in case blob was unlinked prior to close
-    TryPurge();
-    return ZX_OK;
+    return TryPurge();
 }
 
-void VnodeBlob::Purge() {
+zx_status_t VnodeBlob::Purge() {
     ZX_DEBUG_ASSERT(fd_count_ == 0);
     ZX_DEBUG_ASSERT(Purgeable());
-    blobfs_->PurgeBlob(this);
+    zx_status_t status = blobfs_->PurgeBlob(this);
     SetState(kBlobStatePurged);
+    return status;
 }
 
 } // namespace blobfs

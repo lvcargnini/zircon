@@ -17,14 +17,11 @@ namespace {
 constexpr const char* kUuidNameFormat = "%08x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x";
 constexpr size_t kUuidNameLength = 36;
 
-constexpr const char kFirmwarePathPrefix[] = "/boot/lib/firmware/";
 constexpr const char kTaFileExtension[] = ".ta";
 
-// The length of a path to a trusted app consists of the path prefix, the UUID, and file extension
+// The length of a path to a trusted app consists of its UUID and file extension
 // Subtracting 1 from sizeof(char[])s to account for the terminating null character.
-constexpr size_t kTaPathLength = (sizeof(kFirmwarePathPrefix) - 1u) +
-                                 kUuidNameLength +
-                                 (sizeof(kTaFileExtension) - 1u);
+constexpr size_t kTaPathLength = kUuidNameLength + (sizeof(kTaFileExtension) - 1u);
 
 template <typename SRC_T, typename DST_T>
 static constexpr typename fbl::enable_if<
@@ -69,12 +66,23 @@ static fbl::StringBuffer<kUuidNameLength> BuildUuidString(const TEEC_UUID& ta_uu
     return buf;
 }
 
-// Builds the expected path to a trusted application, given its UUID string.
-static fbl::StringBuffer<kTaPathLength> BuildTaPath(const fbl::StringPiece& uuid_str) {
+// Builds the expected path to a trusted application, formatting the file name per the RFC 4122
+// specification.
+static fbl::StringBuffer<kTaPathLength> BuildTaPath(const TEEC_UUID& ta_uuid) {
     fbl::StringBuffer<kTaPathLength> buf;
 
-    buf.Append(kFirmwarePathPrefix);
-    buf.Append(uuid_str);
+    buf.AppendPrintf(kUuidNameFormat,
+                     ta_uuid.timeLow,
+                     ta_uuid.timeMid,
+                     ta_uuid.timeHiAndVersion,
+                     ta_uuid.clockSeqAndNode[0],
+                     ta_uuid.clockSeqAndNode[1],
+                     ta_uuid.clockSeqAndNode[2],
+                     ta_uuid.clockSeqAndNode[3],
+                     ta_uuid.clockSeqAndNode[4],
+                     ta_uuid.clockSeqAndNode[5],
+                     ta_uuid.clockSeqAndNode[6],
+                     ta_uuid.clockSeqAndNode[7]);
     buf.Append(kTaFileExtension);
 
     return buf;
@@ -161,6 +169,9 @@ zx_status_t OpteeClient::OpenSession(const zircon_tee_Uuid* trusted_app,
         return zircon_tee_DeviceOpenSession_reply(txn, kInvalidSession, &result);
     }
 
+    zxlogf(SPEW, "optee: OpenSession returned 0x%" PRIx32 " 0x%" PRIx32 " 0x%" PRIx32 "\n",
+           call_code, message.return_code(), message.return_origin());
+    // TODO(rjascani): Add session id to tracking struct to ensure closure
     result.return_code = message.return_code();
     result.return_origin = message.return_origin();
     return zircon_tee_DeviceOpenSession_reply(txn, message.session_id(), &result);
@@ -170,12 +181,49 @@ zx_status_t OpteeClient::InvokeCommand(uint32_t session_id,
                                        uint32_t command_id,
                                        const zircon_tee_ParameterSet* parameter_set,
                                        fidl_txn_t* txn) {
-    return ZX_ERR_NOT_SUPPORTED;
+    ZX_DEBUG_ASSERT(parameter_set != nullptr);
+
+    zircon_tee_Result result = {};
+
+    InvokeCommandMessage message{controller_->driver_pool(), session_id,
+                                 command_id, *parameter_set};
+
+    if (!message.is_valid()) {
+        result.return_code = TEEC_ERROR_COMMUNICATION;
+        result.return_origin = zircon_tee_ReturnOrigin_COMMUNICATION;
+        return zircon_tee_DeviceInvokeCommand_reply(txn, &result);
+    }
+
+    uint32_t call_code = controller_->CallWithMessage(
+        message, fbl::BindMember(this, &OpteeClient::HandleRpc));
+    if (call_code != kReturnOk) {
+        result.return_code = TEEC_ERROR_COMMUNICATION;
+        result.return_origin = zircon_tee_ReturnOrigin_COMMUNICATION;
+        return zircon_tee_DeviceInvokeCommand_reply(txn, &result);
+    }
+
+    zxlogf(SPEW, "optee: InvokeCommand returned 0x%" PRIx32 " 0x%" PRIx32 " 0x%" PRIx32 "\n",
+           call_code, message.return_code(), message.return_origin());
+    result.return_code = message.return_code();
+    result.return_origin = message.return_origin();
+    return zircon_tee_DeviceInvokeCommand_reply(txn, &result);
 }
 
 zx_status_t OpteeClient::CloseSession(uint32_t session_id,
                                       fidl_txn_t* txn) {
-    return ZX_ERR_NOT_SUPPORTED;
+    CloseSessionMessage message{controller_->driver_pool(), session_id};
+
+    if (!message.is_valid()) {
+        return ZX_ERR_NO_RESOURCES;
+    }
+
+    uint32_t call_code = controller_->CallWithMessage(
+        message, fbl::BindMember(this, &OpteeClient::HandleRpc));
+
+    zxlogf(SPEW, "optee: CloseSession returned %" PRIx32 " %" PRIx32 " %" PRIx32 "\n",
+           call_code, message.return_code(), message.return_origin());
+
+    return zircon_tee_DeviceCloseSession_reply(txn);
 }
 
 template <typename SharedMemoryPoolTraits>
@@ -225,7 +273,7 @@ zx_status_t OpteeClient::AllocateSharedMemory(size_t size,
 zx_status_t OpteeClient::FreeSharedMemory(uint64_t mem_id) {
     // Check if client owns memory that matches the memory id
     SharedMemoryList::iterator mem_iter = FindSharedMemory(mem_id);
-    if (mem_iter == allocated_shared_memory_.end()) {
+    if (!mem_iter.IsValid()) {
         return ZX_ERR_NOT_FOUND;
     }
 
@@ -247,6 +295,26 @@ OpteeClient::SharedMemoryList::iterator OpteeClient::FindSharedMemory(uint64_t m
         [mem_id_ptr_val](auto& item) {
             return mem_id_ptr_val == reinterpret_cast<uintptr_t>(&item);
         });
+}
+
+void* OpteeClient::GetSharedMemoryPointer(const SharedMemoryList::iterator mem_iter,
+                                          size_t min_size,
+                                          zx_off_t offset) {
+    if (!mem_iter.IsValid()) {
+        zxlogf(ERROR, "optee: received invalid shared memory region!\n");
+        return nullptr;
+    }
+
+    size_t mem_size = mem_iter->size();
+    if (offset > 0 && offset >= mem_size) {
+        zxlogf(ERROR, "optee: expected offset into shared memory region exceeds its bounds!\n");
+        return nullptr;
+    } else if (mem_size - offset < min_size) {
+        zxlogf(ERROR, "optee: received shared memory region smaller than expected!\n");
+        return nullptr;
+    }
+
+    return reinterpret_cast<void*>(mem_iter->vaddr() + offset);
 }
 
 zx_status_t OpteeClient::HandleRpc(const RpcFunctionArgs& args, RpcFunctionResult* out_result) {
@@ -323,12 +391,7 @@ zx_status_t OpteeClient::HandleRpcCommand(const RpcFunctionExecuteCommandsArgs& 
     // This dispatcher method only checks that the memory needed for the header is valid. Commands
     // that require more memory than just the header will need to do further memory checks.
     SharedMemoryList::iterator mem_iter = FindSharedMemory(mem_id);
-    if (mem_iter == allocated_shared_memory_.end()) {
-        zxlogf(ERROR, "optee: invalid shared memory region passed into RPC command!\n");
-        return ZX_ERR_INVALID_ARGS;
-    } else if (mem_iter->size() < sizeof(MessageHeader)) {
-        zxlogf(ERROR,
-               "optee: shared memory region passed into RPC command is too small\n");
+    if (GetSharedMemoryPointer(mem_iter, sizeof(MessageHeader), 0) == nullptr) {
         return ZX_ERR_INVALID_ARGS;
     }
 
@@ -408,28 +471,17 @@ zx_status_t OpteeClient::HandleRpcCommandLoadTa(LoadTaRpcMessage* message) {
                                message->memory_reference_offset();
 
     // Try to find the SharedMemory based on the memory id
-    uint8_t* out_ta_mem; // Where to write the TA in memory
+    void* out_ta_mem; // Where to write the TA in memory
 
     if (message->memory_reference_id() != 0) {
         SharedMemoryList::iterator out_mem_iter = FindSharedMemory(message->memory_reference_id());
-        if (out_mem_iter == allocated_shared_memory_.end()) {
-            // Valid memory reference could not be found and TEE is not querying size
-            zxlogf(ERROR,
-                   "optee: received invalid memory reference from TEE command to load TA!\n");
-            message->set_return_code(TEEC_ERROR_BAD_PARAMETERS);
-            return ZX_ERR_INVALID_ARGS;
-        } else if (mem_usable_size > out_mem_iter->size()) {
-            // The TEE is claiming the memory reference given is larger than it actually is
-            // We want to catch this in case TEE is buggy
-            zxlogf(ERROR,
-                   "optee: TEE claimed a memory reference's size is larger than the real memory"
-                   "size!\n");
+        out_ta_mem = GetSharedMemoryPointer(out_mem_iter,
+                                            mem_usable_size,
+                                            message->memory_reference_offset());
+        if (out_ta_mem == nullptr) {
             message->set_return_code(TEEC_ERROR_BAD_PARAMETERS);
             return ZX_ERR_INVALID_ARGS;
         }
-
-        out_ta_mem = reinterpret_cast<uint8_t*>(out_mem_iter->vaddr() +
-                                                message->memory_reference_offset());
     } else {
         // TEE is just querying size of TA, so it sent a memory identifier of 0
         ZX_DEBUG_ASSERT(message->memory_reference_offset() == 0);
@@ -438,8 +490,7 @@ zx_status_t OpteeClient::HandleRpcCommandLoadTa(LoadTaRpcMessage* message) {
         out_ta_mem = nullptr;
     }
 
-    auto ta_name = BuildUuidString(message->ta_uuid());
-    auto ta_path = BuildTaPath(ta_name.ToStringPiece());
+    auto ta_path = BuildTaPath(message->ta_uuid());
 
     // Load the trusted app into a VMO
     size_t ta_size;
@@ -488,8 +539,8 @@ zx_status_t OpteeClient::HandleRpcCommandLoadTa(LoadTaRpcMessage* message) {
 
     if (ta_size < mem_usable_size) {
         // Clear out the rest of the memory after the TA
-        uint8_t* ta_end = out_ta_mem + ta_size;
-        memset(ta_end, 0, mem_usable_size - ta_size);
+        void* ta_end = static_cast<void*>(static_cast<uint8_t*>(out_ta_mem) + ta_size);
+        ::memset(ta_end, 0, mem_usable_size - ta_size);
     }
 
     message->set_return_code(TEEC_SUCCESS);

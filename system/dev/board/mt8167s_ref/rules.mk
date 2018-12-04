@@ -15,6 +15,7 @@ MODULE_SRCS := \
     $(LOCAL_DIR)/mt8167-soc.cpp \
     $(LOCAL_DIR)/mt8167-gpio.cpp \
     $(LOCAL_DIR)/mt8167-display.cpp \
+    $(LOCAL_DIR)/mt8167-i2c.cpp \
 
 MODULE_STATIC_LIBS := \
     system/dev/lib/mt8167 \
